@@ -128,10 +128,61 @@ occurred **twice**; the FVG filter narrows further. The temporal coupling
   arms a pending setup for K bars; enter on MSS while armed; FVG still
   required) — converts "MSS on this exact bar" to "MSS within K bars",
   roughly an order of magnitude more chains to evaluate.
-- 15m needs a different exit design (wider stops, longer horizons) before
-  it is worth revisiting; as-tested it is not viable.
+- ~~15m needs a different exit design…~~ **See the correction below — the
+  15m finding was retracted.**
 - Re-run: `python backtest.py --days 60 --slippage-bps 2` (and 15m via the
   same harness) after market regime shifts or checklist changes.
+
+### Sep 25, 2026 (later) — data-integrity correction: 15m finding retracted
+
+While validating the two-stage detector, the earlier results failed a
+cross-check: the same strict configuration produced 2, 79, and 128 signals
+depending on which harness ran it. Root cause: the cached dataset used for
+the 15m/60-day studies was a **continuous per-symbol index** spanning all
+44 days, so the 46-bar context window at each 9:30 open contained **the
+prior session's late-day bars**. The detector then read the overnight gap
+against yesterday's range as a "sweep + MSS + FVG" — i.e. the 41–42
+"15m trades" were mostly **gap-continuation artifacts**, not TJR liquidity
+sequences. The strict checklist never fired at all on 15m bars once context
+was correctly confined to the current session (0 setups, 528 symbol-days,
+both windows).
+
+**Protocol fix (now the standard):** datasets must be sliced per symbol-day
+(07:00–16:00 ET) *before* resampling and *before* windowing, matching the
+live scanner's per-run context; caches are verified frame-by-frame against
+the validated `_fetch_day` path (byte-equality on sampled days) before any
+study runs.
+
+**Re-run results on the verified dataset (5m, extended 09:30–15:55,
+44 sessions × 12 symbols, 2bps slippage):**
+
+| arm (SWEEP_ARM_BARS) | raw signals | trades | win% | avg R | PF | P&L |
+|---|---|---|---|---|---|---|
+| 5 (strict baseline) | 8 | 8 | 62% | −0.19 | 1.66 | +$6 |
+| 8 | 11 | 10 | 50% | −0.26 | 1.64 | +$8 |
+| 12 | 12 | 11 | 27% | −0.61 | 0.27 | −$17 |
+| 15 | 4 | 3 | 67% | −0.33 | 1.93 | +$3 |
+
+(All counts are tiny — 3–11 trades — so none of these PFs is meaningful;
+the arm=15 dip is partly an artifact of `min_bars` growing with the arm,
+which pushes the first evaluable bar later into the session. Several exits
+are `EOD-DATA`: the data slice ends before the flatten bar prints.)
+
+**Corrected conclusions**
+1. On 5m bars the strict sequence is genuinely rare (~0.015 signals /
+   symbol-day extended; ~0 in the 9:30–11:00 window) — the original 5m
+   conclusion stands.
+2. **The 15m "frequency fix" was an artifact.** On correct per-session
+   context, 15m produces no setups at all. The timeframe hypothesis is
+   dead as tested.
+3. Two-stage arming (5→15 bars) does **not** demonstrate an edge on this
+   sample: frequency rises slightly, quality does not. The knob ships
+   (`SWEEP_ARM_BARS`, default 5 = strict baseline) for future re-tests,
+   but the strict default stays.
+4. The earlier PF 2.06 / +$246 arm=5 result is likewise retracted — it was
+   the same cross-session leakage in serialized-trade form.
+5. Every future study must use the per-day slice + byte-verification
+   protocol before results are recorded here.
 
 ## Known deviations from the original spec
 

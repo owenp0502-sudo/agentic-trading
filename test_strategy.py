@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+import config
 import strategy
 from config import TIMEZONE
 
@@ -175,6 +176,60 @@ def test_forming_bar_dropped() -> None:
     res_with_forming = strategy.evaluate_tjr_setup(pd.concat([df, now_row]))
     assert res_with_forming == res_closed
     assert res_closed["setup_valid"] is True, res_closed
+
+
+def _delayed_setup(arm_bars: int = 12) -> pd.DataFrame:
+    """Two-stage variant: sweep 10 bars ago, displacement NOW.
+
+    Strict arm (5) never sees the sweep → no setup. Wide arm (≥10) fires:
+    sweep @ -10 → quiet drift → displacement leg -3..-1 (MSS close + FVG
+    between -3.high 100.30 and -2.low 100.48).
+    """
+    n = max(25, 20 + arm_bars + 1) + 2
+    when = datetime(2026, 9, 24, 10, 30, tzinfo=NY)
+    df = _session_bars(n, when - timedelta(minutes=5 * (n - 1)))
+    loc = df.columns.get_loc
+    df.iloc[-10, loc("low")] = 99.00                      # sweep low
+    df.iloc[-10, loc("high")] = 100.01
+    df.iloc[-10, loc("close")] = 100.02                   # back inside
+    for p in range(-9, -3):                               # quiet drift up
+        df.iloc[p, loc("close")] = 100.10 + 0.02 * (p + 9)
+        df.iloc[p, loc("high")] = df.iloc[p, loc("close")] + 0.02
+        df.iloc[p, loc("low")] = df.iloc[p, loc("close")] - 0.02
+    # displacement leg: MSS close @ -1, FVG -3.high → -2.low = 0.18
+    df.iloc[-3, loc("high")] = 100.30
+    df.iloc[-3, loc("low")] = 100.26
+    df.iloc[-3, loc("close")] = 100.28
+    df.iloc[-2, loc("low")] = 100.48
+    df.iloc[-2, loc("high")] = 100.52
+    df.iloc[-2, loc("close")] = 100.50
+    df.iloc[-1, loc("low")] = 100.46
+    df.iloc[-1, loc("high")] = 100.60
+    df.iloc[-1, loc("close")] = 100.55
+    return df
+
+
+def test_two_stage_delayed_chain_fires_with_wide_arm() -> None:
+    old = config.SWEEP_ARM_BARS
+    try:
+        config.SWEEP_ARM_BARS = 12
+        res = strategy.evaluate_tjr_setup(_delayed_setup(12))
+        assert res["setup_valid"] is True, res
+        assert res["direction"] == "BUY"
+        assert res["checks"]["sweep_age_bars"] == 9
+    finally:
+        config.SWEEP_ARM_BARS = old
+
+
+def test_delayed_chain_rejected_by_strict_arm() -> None:
+    old = config.SWEEP_ARM_BARS
+    try:
+        config.SWEEP_ARM_BARS = 5
+        res = strategy.evaluate_tjr_setup(_delayed_setup(12))
+        assert res["setup_valid"] is False
+        assert res["checks"]["liquidity_sweep"] is False
+    finally:
+        config.SWEEP_ARM_BARS = old
 
 
 def test_sweep_without_mss_fails() -> None:

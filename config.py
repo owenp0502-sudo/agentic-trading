@@ -37,6 +37,19 @@ def _get_env_float(key: str, default: float) -> float:
         return default
 
 
+def _get_env_int(key: str, default: int) -> int:
+    """Fetch an int env var; fall back to default on missing/garbage."""
+    raw = _get_env(key)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not an int — using default %s",
+                       key, raw, default)
+        return default
+
+
 # ---------------------------------------------------------------------------
 # API keys / secrets
 # ---------------------------------------------------------------------------
@@ -135,6 +148,10 @@ FALLBACK_ACCOUNT_BALANCE: Optional[float] = (
 # ---------------------------------------------------------------------------
 SWEEP_LOOKBACK: int = 20               # Bars scanned for liquidity (stops) grabs
 SWEEP_SCAN_BARS: int = 5               # Sweep must occur within last N bars (25 min)
+SWEEP_ARM_BARS: int = _get_env_int(    # Two-stage detector: sweep 'arms' the
+    "SWEEP_ARM_BARS", 5)               # setup for N bars; MSS while armed
+                                       # fires. 5 == strict baseline (MSS bar
+                                       # coincides with sweep window).
 MSS_LOOKBACK: int = 10                 # Swing-point window for structure shift
 FVG_SCAN_BARS: int = 6                 # FVG searched within last N bars (disp. leg)
 FVG_MIN_IMBALANCE_PCT: float = 0.15    # Min FVG size as % of asset price

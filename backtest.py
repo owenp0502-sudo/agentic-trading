@@ -136,10 +136,11 @@ def _simulate_long(bars: pd.DataFrame, sig_idx: int, sweep_level: Optional[float
 def run(days: int, symbols: List[str], equity: float, allow_shorts: bool,
         slip_bps: float, session_start: Optional[str] = None,
         session_end: Optional[str] = None, no_fvg: bool = False,
-        max_stop_pct: Optional[float] = None) -> None:
+        max_stop_pct: Optional[float] = None,
+        arm_bars: Optional[int] = None) -> None:
     # Optional experiment overrides (restored after the run)
     saved = (config.SESSION_START, config.SESSION_END, config.FVG_REQUIRED,
-             config.MAX_STOP_DISTANCE_PCT)
+             config.MAX_STOP_DISTANCE_PCT, config.SWEEP_ARM_BARS)
     if session_start:
         config.SESSION_START = session_start
     if session_end:
@@ -148,11 +149,13 @@ def run(days: int, symbols: List[str], equity: float, allow_shorts: bool,
         config.FVG_REQUIRED = False
     if max_stop_pct is not None:
         config.MAX_STOP_DISTANCE_PCT = max_stop_pct
+    if arm_bars is not None:
+        config.SWEEP_ARM_BARS = arm_bars
     try:
         _run_inner(days, symbols, equity, allow_shorts, slip_bps)
     finally:
         (config.SESSION_START, config.SESSION_END, config.FVG_REQUIRED,
-         config.MAX_STOP_DISTANCE_PCT) = saved
+         config.MAX_STOP_DISTANCE_PCT, config.SWEEP_ARM_BARS) = saved
 
 
 def _run_inner(days: int, symbols: List[str], equity: float,
@@ -295,9 +298,12 @@ if __name__ == "__main__":
                     help="override close-out time HH:MM ET")
     ap.add_argument("--max-stop-pct", type=float, default=None,
                     help="override the structural stop clamp, e.g. 0.03")
+    ap.add_argument("--arm-bars", type=int, default=None,
+                    help="two-stage detector: sweep arms the setup for N "
+                         "bars (default: config value, strict = 5)")
     args = ap.parse_args()
     if args.flatten_time:
         config.FLATTEN_TIME = args.flatten_time
     run(args.days, [s.upper() for s in args.symbols], args.equity,
         args.allow_shorts, args.slippage_bps, args.session_start,
-        args.session_end, args.no_fvg, args.max_stop_pct)
+        args.session_end, args.no_fvg, args.max_stop_pct, args.arm_bars)

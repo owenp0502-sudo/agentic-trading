@@ -75,7 +75,7 @@ def _find_sweep(df: pd.DataFrame, scan_bars: int) -> Tuple[Optional[str], Option
     Bearish is the mirror at the 20-bar high.
 
     Returns (direction, df-position-index of sweep bar, swept level).
-    Position index is negative (pandas-style), e.g. -1 = trigger bar.
+    Position index is a 0-based df position (e.g. n-1 = trigger bar).
     """
     n = len(df)
     for offset in range(1, scan_bars + 1):          # most recent first
@@ -114,7 +114,7 @@ def _check_mss(df: pd.DataFrame, direction: str) -> Tuple[bool, Optional[float]]
 
 
 def _find_fvg(df: pd.DataFrame, direction: str, sweep_pos: int,
-              price: float) -> Tuple[bool, Optional[float]]:
+              price: float, scan_bars: Optional[int] = None) -> Tuple[bool, Optional[float]]:
     """
     Fair Value Gap: 3-candle imbalance.
 
@@ -126,13 +126,16 @@ def _find_fvg(df: pd.DataFrame, direction: str, sweep_pos: int,
     Scans direction-consistent windows from most recent backwards; the FVG
     must sit at/after the sweep bar (in the displacement leg, not before it).
     Gap must be >= FVG_MIN_IMBALANCE_PCT (0.15%) of the asset price.
+    `scan_bars` stretches the search window (two-stage detector scans the
+    full arming window so older displacement legs stay eligible).
     """
+    scan_bars = scan_bars or config.FVG_SCAN_BARS
     min_gap = (config.FVG_MIN_IMBALANCE_PCT / 100.0) * price
     n = len(df)
     # Oldest→newest so "most recent wins" via overwriting.
     found = False
     fvg_price: Optional[float] = None
-    for i in range(n - config.FVG_SCAN_BARS, n):
+    for i in range(n - scan_bars, n):
         if i - 2 < 0 or i < sweep_pos:   # needs 3 bars; must be at/after sweep
             continue
         c1, _c2, c3 = df.iloc[i - 2], df.iloc[i - 1], df.iloc[i]
@@ -201,7 +204,7 @@ def evaluate_tjr_setup(df: pd.DataFrame) -> Dict[str, object]:
 
     df = drop_forming_bar(df.sort_index())
     min_bars = max(config.MIN_BARS_REQUIRED,
-                   config.SWEEP_LOOKBACK + config.SWEEP_SCAN_BARS + 1)
+                   config.SWEEP_LOOKBACK + config.SWEEP_ARM_BARS + 1)
     if len(df) < min_bars:
         checks["error"] = f"only {len(df)} closed bars, need >= {min_bars}"
         return invalid
@@ -216,10 +219,15 @@ def evaluate_tjr_setup(df: pd.DataFrame) -> Dict[str, object]:
 
     price = float(df.iloc[-1]["close"])
 
-    # --- Check 2: liquidity sweep (recent window) -------------------------
-    sweep_dir, sweep_pos, sweep_level = _find_sweep(df, config.SWEEP_SCAN_BARS)
+    # --- Check 2: liquidity sweep — the ARMING window ---------------------
+    # Two-stage detector: a sweep arms the setup for SWEEP_ARM_BARS bars.
+    # Default 5 == strict baseline (sweep must be within 25 min); larger
+    # values let an MSS that follows later still fire (SWEEP_ARM_BARS env).
+    sweep_dir, sweep_pos, sweep_level = _find_sweep(df, config.SWEEP_ARM_BARS)
     checks["liquidity_sweep"] = sweep_dir is not None
     checks["sweep_level"] = sweep_level
+    checks["sweep_age_bars"] = ((len(df) - 1) - sweep_pos
+                                if sweep_pos is not None else None)
     if sweep_dir is None:
         return invalid
 
@@ -234,7 +242,11 @@ def evaluate_tjr_setup(df: pd.DataFrame) -> Dict[str, object]:
     # --- Check 4: FVG in the displacement leg -----------------------------
     # FVG_REQUIRED=0 trades the sweep→MSS sequence alone (frequency over
     # confirmation quality — backtest before enabling in production).
-    fvg_ok, fvg_price = _find_fvg(df, direction, sweep_pos, price)
+    # The FVG search window stretches with the arming window so displacement
+    # legs from older sweeps stay eligible.
+    fvg_ok, fvg_price = _find_fvg(
+        df, direction, sweep_pos, price,
+        scan_bars=max(config.FVG_SCAN_BARS, config.SWEEP_ARM_BARS))
     checks["fvg"] = fvg_ok
     checks["fvg_price"] = round(fvg_price, 4) if fvg_price is not None else None
     if config.FVG_REQUIRED and not fvg_ok:
