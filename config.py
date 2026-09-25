@@ -24,6 +24,19 @@ def _get_env(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
 
 
+def _get_env_float(key: str, default: float) -> float:
+    """Fetch a float env var; fall back to default on missing/garbage."""
+    raw = _get_env(key)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("%s=%r is not a float — using default %s",
+                       key, raw, default)
+        return default
+
+
 # ---------------------------------------------------------------------------
 # API keys / secrets
 # ---------------------------------------------------------------------------
@@ -75,14 +88,31 @@ MIN_TRADE_NOTIONAL: float = 1.0        # Robinhood minimum order value ($)
 # ---------------------------------------------------------------------------
 # Exit strategy (deterministic — the LLM never sets exit levels)
 # ---------------------------------------------------------------------------
-# Bracket around average cost: stop = cost ± STOP_LOSS_PCT, target =
-# cost ± STOP_LOSS_PCT × TAKE_PROFIT_R (a 2R target by default).
-STOP_LOSS_PCT: float = 0.005           # 0.5% adverse move from cost
-TAKE_PROFIT_R: float = 2.0             # target = 2× the stop distance
-# Time (America/New_York, zero-padded HH:MM) at/after which the close-out run
-# flattens every open position and cancels resting orders. The 11:00 and
-# 11:05 crons enforce it; stops are also resting GTC broker-side.
-FLATTEN_TIME: str = "11:00"
+# Stop distance as a fraction of entry cost — fallback when no structural
+# anchor is available. Target = TAKE_PROFIT_R × the actual stop distance.
+STOP_LOSS_PCT: float = _get_env_float("STOP_LOSS_PCT", 0.005)   # 0.5%
+TAKE_PROFIT_R: float = _get_env_float("TAKE_PROFIT_R", 2.0)     # 2R target
+
+# Anchor the stop to the sweep level (TJR structure) when the scanner
+# provides one: just beyond the swept extreme, with the distance clamped
+# to [MIN, MAX] % of cost so noise can't stop us out and tails are bounded.
+USE_STRUCTURAL_STOP: bool = _get_env(
+    "USE_STRUCTURAL_STOP", "1").lower() not in ("0", "false", "no")
+STRUCTURAL_STOP_BUFFER_PCT: float = 0.0005   # 5bps beyond the sweep extreme
+MIN_STOP_DISTANCE_PCT: float = 0.001         # 0.1% — noise floor
+MAX_STOP_DISTANCE_PCT: float = 0.02          # 2.0% — tail-risk bound
+
+# Trailing policy (the monitor ratchets the resting stop; never loosens):
+#   stage 1 — once price moves TRAIL_BREAKEVEN_R × risk in our favor,
+#             stop moves to entry (breakeven). 0 disables.
+#   stage 2 — if TRAIL_STOP_PCT > 0, stop then trails last price at that
+#             % distance. 0 disables (breakeven-only by default).
+TRAIL_BREAKEVEN_R: float = _get_env_float("TRAIL_BREAKEVEN_R", 1.0)
+TRAIL_STOP_PCT: float = _get_env_float("TRAIL_STOP_PCT", 0.0)
+
+# Time (America/New_York, HH:MM) at/after which the close-out run flattens
+# every open position and cancels resting orders (11:00 + 11:05 crons).
+FLATTEN_TIME: str = _get_env("FLATTEN_TIME", "11:00")
 
 # ---------------------------------------------------------------------------
 # Session window (all logic uses America/New_York; never local machine time)

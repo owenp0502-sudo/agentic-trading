@@ -19,8 +19,8 @@ NY = ZoneInfo(config.TIMEZONE)
 # ---------------------------------------------------------------------------
 def test_bracket_levels_long():
     stop, target = exits.bracket_levels("BUY", 100.0)
-    assert stop == 99.5          # 0.5% below cost
-    assert target == 101.0       # 1.0% above cost (2R)
+    assert stop == 99.5          # fallback: 0.5% below cost
+    assert target == 101.0       # 2R from the actual stop distance
 
 
 def test_bracket_levels_short():
@@ -35,6 +35,109 @@ def test_bracket_levels_rejects_bad_cost():
         assert False, "should raise on zero cost"
     except ValueError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Structural stop (sweep-level anchor) + clamps
+# ---------------------------------------------------------------------------
+def test_structural_stop_long_beyond_sweep():
+    # sweep low 99.0 → stop just beyond it (5bps buffer): 98.9505
+    stop = exits.compute_stop("BUY", 100.0, 99.0)
+    assert stop == 98.9505
+    # target = 2R from the structural risk (1.0495 → ×2 = 2.099)
+    assert exits.compute_target("BUY", 100.0, stop) == 102.099
+
+
+def test_structural_stop_clamped_to_max_distance():
+    # sweep 95.0 → raw distance 5.05% > 2% cap → stop = 98.0
+    assert exits.compute_stop("BUY", 100.0, 95.0) == 98.0
+
+
+def test_structural_stop_clamped_to_min_distance():
+    # sweep 99.95 → raw distance ~0.1% → at/below floor → stop = 99.9
+    assert exits.compute_stop("BUY", 100.0, 99.95) == 99.9
+
+
+def test_structural_stop_never_above_cost_for_long():
+    # nonsensical anchor above cost → clamped to the noise floor
+    stop = exits.compute_stop("BUY", 100.0, 101.0)
+    assert stop == 99.9
+    assert stop < 100.0
+
+
+def test_structural_stop_short_mirrored():
+    # sweep high 101.0 → stop just beyond: 101.0505
+    stop = exits.compute_stop("SELL", 100.0, 101.0)
+    assert stop == 101.0505
+
+
+def test_structural_stop_disabled_falls_back():
+    old = config.USE_STRUCTURAL_STOP
+    try:
+        config.USE_STRUCTURAL_STOP = False
+        assert exits.compute_stop("BUY", 100.0, 99.0) == 99.5
+    finally:
+        config.USE_STRUCTURAL_STOP = old
+
+
+# ---------------------------------------------------------------------------
+# Trailing ratchet (breakeven + optional % trail; monotonic)
+# ---------------------------------------------------------------------------
+def test_trailed_stop_breakeven_long():
+    # risk 0.5 (stop 99.5); profit 0.6 ≥ 1.0R → stop ratchets to cost
+    assert exits.trailed_stop("BUY", 100.0, 99.5, 100.6) == 100.0
+
+
+def test_trailed_stop_not_triggered_yet():
+    # profit 0.4 < 1.0R → no change
+    assert exits.trailed_stop("BUY", 100.0, 99.5, 100.4) is None
+
+
+def test_trailed_stop_monotonic_no_churn():
+    # already at breakeven, no % trail configured → no new order
+    assert exits.trailed_stop("BUY", 100.0, 100.0, 100.6) is None
+
+
+def test_trailed_stop_percent_trail_after_breakeven():
+    old = config.TRAIL_STOP_PCT
+    try:
+        config.TRAIL_STOP_PCT = 0.003
+        # stop already at BE; last 101 → trail 3% behind = 100.697
+        assert exits.trailed_stop("BUY", 100.0, 100.0, 101.0) == 100.697
+        # never tightens past the current stop's side: tiny move → no churn
+        assert exits.trailed_stop("BUY", 100.0, 100.0, 100.1) is None
+    finally:
+        config.TRAIL_STOP_PCT = old
+
+
+def test_trailed_stop_short_mirror():
+    # risk 0.5 (stop 100.5); profit 0.6 ≥ 1R → stop to breakeven
+    assert exits.trailed_stop("SELL", 100.0, 100.5, 99.4) == 100.0
+
+
+def test_trailed_stop_never_loosens_long():
+    # price spiked then faded: trail candidate below current stop → keep
+    old = config.TRAIL_STOP_PCT
+    try:
+        config.TRAIL_STOP_PCT = 0.003
+        assert exits.trailed_stop("BUY", 100.0, 100.697, 100.5) is None
+    finally:
+        config.TRAIL_STOP_PCT = old
+
+
+# ---------------------------------------------------------------------------
+# Active-stop awareness in hit checks
+# ---------------------------------------------------------------------------
+def test_stop_hit_uses_active_stop_when_tighter():
+    # initial bracket stop would be 99.5; ratcheted stop 99.75 breached at 99.7
+    assert exits.stop_hit("BUY", 100.0, 99.7, active_stop=99.75) is True
+    assert exits.stop_hit("BUY", 100.0, 99.8, active_stop=99.75) is False
+
+
+def test_target_hit_unchanged_by_ratchet():
+    # target stays anchored to the INITIAL risk even after stop ratchets
+    assert exits.target_hit("BUY", 100.0, 101.05) is True
+    assert exits.target_hit("BUY", 100.0, 100.9) is False
 
 
 # ---------------------------------------------------------------------------

@@ -44,27 +44,112 @@ NY_TZ = ZoneInfo(config.TIMEZONE)
 # ---------------------------------------------------------------------------
 # Pure helpers (unit-tested in test_exits.py — no network)
 # ---------------------------------------------------------------------------
-def bracket_levels(side: str, cost: float) -> Tuple[float, float]:
-    """(stop, target) for the entry side around average cost."""
+def compute_stop(side: str, cost: float,
+                 structural_level: Optional[float] = None) -> float:
+    """
+    Stop price for the entry side.
+
+    Preferred (config.USE_STRUCTURAL_STOP): just beyond the sweep extreme
+    (TJR structure — the level that, if traded through, invalidates the
+    setup), buffered by STRUCTURAL_STOP_BUFFER_PCT. The resulting distance
+    is clamped to [MIN_STOP_DISTANCE_PCT, MAX_STOP_DISTANCE_PCT] of cost so
+    micro-noise can't stop us out and tails stay bounded.
+
+    Fallback: fixed STOP_LOSS_PCT from cost (clamped to the same bounds).
+    """
     if cost <= 0:
         raise ValueError(f"cost must be positive, got {cost}")
-    if side == "BUY":
-        stop = cost * (1 - config.STOP_LOSS_PCT)
-        target = cost * (1 + config.STOP_LOSS_PCT * config.TAKE_PROFIT_R)
-    else:  # SELL (short)
-        stop = cost * (1 + config.STOP_LOSS_PCT)
-        target = cost * (1 - config.STOP_LOSS_PCT * config.TAKE_PROFIT_R)
-    return round(stop, 4), round(target, 4)
+
+    def _clamp(dist_pct: float) -> float:
+        return min(max(dist_pct, config.MIN_STOP_DISTANCE_PCT),
+                   config.MAX_STOP_DISTANCE_PCT)
+
+    if (structural_level and structural_level > 0
+            and config.USE_STRUCTURAL_STOP):
+        buf = config.STRUCTURAL_STOP_BUFFER_PCT
+        if side == "BUY":
+            raw_dist = (cost - structural_level * (1 - buf)) / cost
+        else:
+            raw_dist = (structural_level * (1 + buf) - cost) / cost
+        dist_pct = _clamp(raw_dist)
+    else:
+        dist_pct = _clamp(config.STOP_LOSS_PCT)
+
+    stop = cost * (1 - dist_pct) if side == "BUY" else cost * (1 + dist_pct)
+    return round(stop, 4)
 
 
-def stop_hit(side: str, cost: float, last: float) -> bool:
-    stop, _ = bracket_levels(side, cost)
+def compute_target(side: str, cost: float, stop: float) -> float:
+    """Target = TAKE_PROFIT_R × the actual stop distance (risk-based R)."""
+    risk = abs(cost - stop)
+    target = (cost + risk * config.TAKE_PROFIT_R if side == "BUY"
+              else cost - risk * config.TAKE_PROFIT_R)
+    return round(target, 4)
+
+
+def bracket_levels(side: str, cost: float,
+                   structural_level: Optional[float] = None) -> Tuple[float, float]:
+    """(stop, target) around average cost — structural anchor if provided."""
+    stop = compute_stop(side, cost, structural_level)
+    return stop, compute_target(side, cost, stop)
+
+
+def stop_hit(side: str, cost: float, last: float,
+             active_stop: Optional[float] = None) -> bool:
+    """Stop breached? Uses the ACTIVE (possibly ratcheted) stop when known,
+    else the initial bracket from cost."""
+    stop = active_stop if active_stop and active_stop > 0 \
+        else compute_stop(side, cost)
     return last <= stop if side == "BUY" else last >= stop
 
 
 def target_hit(side: str, cost: float, last: float) -> bool:
+    """Target breached? Anchored to the INITIAL stop distance from cost —
+    ratcheting the stop must never move the take-profit (otherwise a
+    breakeven stop would imply a target at cost and insta-close the
+    position at market)."""
     _, target = bracket_levels(side, cost)
     return last >= target if side == "BUY" else last <= target
+
+
+def trailed_stop(side: str, cost: float, current_stop: float,
+                 last: float) -> Optional[float]:
+    """
+    Ratchet policy (returns the new stop, or None to keep the current one).
+    Stateless by design: the monitor reads the resting stop from the broker,
+    so a crashed run never loses trail state.
+
+      stage 1 — profit ≥ TRAIL_BREAKEVEN_R × risk → stop to breakeven (cost)
+      stage 2 — post-breakeven and TRAIL_STOP_PCT > 0 → trail last price
+                at that % distance
+
+    Monotonic: only ever tightens (never below the current stop for longs,
+    never above for shorts).
+    """
+    if cost <= 0 or current_stop <= 0 or last <= 0:
+        return None
+    risk = abs(cost - current_stop)
+    candidate: Optional[float] = None
+
+    if side == "BUY":
+        profit = last - cost
+        if risk > 0 and profit >= config.TRAIL_BREAKEVEN_R * risk:
+            candidate = cost
+        if current_stop >= cost and config.TRAIL_STOP_PCT > 0:
+            trail = last * (1 - config.TRAIL_STOP_PCT)
+            candidate = trail if candidate is None else max(candidate, trail)
+        if candidate is not None and candidate > current_stop + 0.005:
+            return round(candidate, 4)
+    else:
+        profit = cost - last
+        if risk > 0 and profit >= config.TRAIL_BREAKEVEN_R * risk:
+            candidate = cost
+        if current_stop <= cost and config.TRAIL_STOP_PCT > 0:
+            trail = last * (1 + config.TRAIL_STOP_PCT)
+            candidate = trail if candidate is None else min(candidate, trail)
+        if candidate is not None and candidate < current_stop - 0.005:
+            return round(candidate, 4)
+    return None
 
 
 def should_flatten(now: datetime) -> bool:
@@ -170,7 +255,8 @@ def parse_last_price(quotes_raw: str, symbol: str) -> Optional[float]:
 
 
 def parse_open_orders(orders_raw: str) -> List[Dict[str, Any]]:
-    """[{order_id, symbol, side, type}] for resting (cancellable) orders."""
+    """[{order_id, symbol, side, type, stop_price, limit_price, quantity}]
+    for resting (cancellable) orders."""
     states = {"new", "queued", "confirmed", "unconfirmed", "partially_filled"}
     out: List[Dict[str, Any]] = []
     seen: set = set()
@@ -185,6 +271,9 @@ def parse_open_orders(orders_raw: str) -> List[Dict[str, Any]]:
                     "symbol": str(d.get("symbol", "")).upper(),
                     "side": str(d.get("side", "")).lower(),
                     "type": str(d.get("type", "")).lower(),
+                    "stop_price": _as_float(d.get("stop_price")),
+                    "limit_price": _as_float(d.get("limit_price")),
+                    "quantity": _as_float(d.get("quantity")),
                 })
     return out
 
@@ -297,7 +386,10 @@ async def _attach_protections(signal: Dict[str, Any]) -> str:
                     f"(fill may not have settled yet; monitor will retry "
                     f"nothing — next entry requires a new signal)")
         cost = float(pos["avg_cost"])
-        stop, target = bracket_levels(side, cost)
+        anchor = signal.get("stop_anchor")
+        stop = compute_stop(side, cost,
+                            float(anchor) if anchor else None)
+        target = compute_target(side, cost, stop)
 
         stop_resp = await _place(
             session, account, symbol=symbol,
@@ -317,35 +409,72 @@ async def _attach_protections(signal: Dict[str, Any]) -> str:
 
 
 async def _monitor_once() -> List[str]:
-    """One pass: for each open position, close on stop/target hit."""
+    """
+    One pass per open position, in priority order:
+      1. Hard exit  — last price breached the ACTIVE stop or the target →
+                      market-close, cancel leftover resting orders.
+      2. Ratchet    — profit crossed the breakeven/trail thresholds →
+                      cancel + re-place the resting stop tighter.
+    The resting stop order on the broker is the source of truth (stateless,
+    crash-safe); when no resting stop exists, fall back to the computed
+    initial bracket from cost.
+    """
     actions: List[str] = []
     async with executor_session() as session:
         account = await _get_account_number(session)
+        open_orders = await _get_open_orders(session, account)
         for pos in await _get_positions(session, account):
             symbol, qty, cost = pos["symbol"], pos["quantity"], pos["avg_cost"]
             if not cost:
                 actions.append(f"{symbol}: no avg cost — skipping monitor")
                 continue
-            side = "BUY"  # pipeline is long-only in practice; long exit math
+            side = "BUY"  # pipeline is long-only in practice
             last = await _get_quote(session, symbol)
             if not last:
                 actions.append(f"{symbol}: no quote — skipping this pass")
                 continue
+
+            resting_stop = next(
+                (o for o in open_orders
+                 if o["symbol"] == symbol and o["type"] == "stop_market"
+                 and o.get("stop_price")), None)
+            active_stop = (resting_stop["stop_price"]
+                           if resting_stop else compute_stop(side, cost))
+
             reason = None
-            if stop_hit(side, cost, last):
-                reason = f"STOP hit (cost {cost}, last {last})"
+            if stop_hit(side, cost, last, active_stop):
+                reason = f"STOP hit (stop {active_stop}, last {last})"
             elif target_hit(side, cost, last):
-                reason = f"TARGET hit (cost {cost}, last {last})"
-            if not reason:
+                reason = f"TARGET hit (last {last})"
+            if reason:
+                close_resp = await _place(
+                    session, account, symbol=symbol, side="sell",
+                    type="market", quantity=str(qty), time_in_force="gfd")
+                actions.append(f"{symbol}: CLOSED — {reason} | {close_resp[:120]}")
+                for o in await _get_open_orders(session, account, symbol):
+                    cancel_resp = await _cancel(session, account, o["order_id"])
+                    actions.append(f"{symbol}: canceled resting {o['type']} "
+                                   f"{o['order_id'][:8]} | {cancel_resp[:80]}")
                 continue
-            close_resp = await _place(
+
+            # --- Ratchet: tighten the resting stop if policy says so ------
+            new_stop = trailed_stop(side, cost, active_stop, last)
+            if new_stop is None:
+                continue
+            if resting_stop:
+                await _cancel(session, account, resting_stop["order_id"])
+            qty_whole = math.floor(qty)
+            if qty_whole < 1:
+                actions.append(f"{symbol}: ratchet wanted stop {new_stop} "
+                               f"but no whole shares to protect — monitor "
+                               f"hard-exit check remains active")
+                continue
+            resp = await _place(
                 session, account, symbol=symbol, side="sell",
-                type="market", quantity=str(qty), time_in_force="gfd")
-            actions.append(f"{symbol}: CLOSED — {reason} | {close_resp[:120]}")
-            for o in await _get_open_orders(session, account, symbol):
-                cancel_resp = await _cancel(session, account, o["order_id"])
-                actions.append(f"{symbol}: canceled resting {o['type']} "
-                               f"{o['order_id'][:8]} | {cancel_resp[:80]}")
+                type="stop_market", quantity=str(qty_whole),
+                stop_price=_fmt_price(new_stop), time_in_force="gtc")
+            actions.append(f"{symbol}: stop ratcheted {active_stop} → "
+                           f"{new_stop} | {resp[:100]}")
     return actions
 
 

@@ -271,6 +271,10 @@ def main() -> None:
                 "dollar_val": round(quantity * stock_price, 2),
                 "stock_price": stock_price,
                 "fvg_price": setup["fvg_price"],
+                # Structural stop anchor: the swept liquidity extreme. If
+                # price trades back through it, the setup is invalidated —
+                # the bracket stop sits just beyond it (clamped).
+                "stop_anchor": setup["checks"].get("sweep_level"),
                 "reason": (
                     f"TJR {setup['direction']}: liquidity sweep + MSS + FVG "
                     f"@ {setup['fvg_price']} on 5m"
