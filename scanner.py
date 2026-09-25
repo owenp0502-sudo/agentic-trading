@@ -47,8 +47,14 @@ except ImportError as exc:
 
 def fetch_5m_bars(client: "StockHistoricalDataClient", symbol: str,
                   lookback_bars: int = 40) -> Optional[pd.DataFrame]:
-    """Fetch recent 5-minute bars (IEX feed = free tier) as a DataFrame."""
-    end = pd.Timestamp.now(tz=config.TIMEZONE)
+    """Fetch recent 5-minute bars (IEX feed = free tier) as a DataFrame.
+
+    Alpaca returns 1-minute bars; they are resampled to true 5-minute OHLCV
+    before the strategy sees them (the SMC math is defined on 5m bars —
+    feeding 1m bars would shrink the 20-bar sweep lookback from 100 min
+    to 20 and corrupt every level).
+    """
+    end = pd.Timestamp.now(tz="UTC")
     # 40 bars ≈ 3.3 hours: comfortably covers the 20-bar sweep lookback
     # plus pre-market context, without pulling a whole day.
     start = end - pd.Timedelta(minutes=5 * (lookback_bars + 6))
@@ -63,10 +69,15 @@ def fetch_5m_bars(client: "StockHistoricalDataClient", symbol: str,
     df = bars.df
     if df is None or df.empty:
         return None
-    if isinstance(df.columns, pd.MultiIndex):  # multi-symbol responses
+    if isinstance(df.index, pd.MultiIndex):  # (symbol, timestamp) rows
         df = df.xs(symbol, level="symbol")
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.xs(symbol, level="symbol", axis=1)
     df = df.rename(columns={c: str(c).lower() for c in df.columns})
-    return df[["open", "high", "low", "close", "volume"]]
+    df = df[["open", "high", "low", "close", "volume"]].resample("5min").agg(
+        {"open": "first", "high": "max", "low": "min",
+         "close": "last", "volume": "sum"}).dropna()
+    return df
 
 
 def get_cash_balance() -> Optional[float]:
@@ -88,6 +99,33 @@ def get_cash_balance() -> Optional[float]:
     except Exception as exc:  # noqa: BLE001
         logger.error("Could not read account cash: %s", exc)
         return None
+
+
+def _report_events(events: List[Dict[str, object]], tag: str) -> None:
+    """Log + Discord every exit-engine event. Exits/ratchets carry
+    action=SELL so the Discord embed shows 'Action: SELL' with the symbol,
+    quantity, and dollar value; notes are log-only unless a detailed
+    reason exists (flatten cancellations)."""
+    for ev in events:
+        line = exits.render_event(ev)
+        logger.info("%s: %s", tag, line)
+        if ev.get("kind") in ("exit", "ratchet"):
+            send_discord_alert(
+                action=str(ev.get("action", "SELL")),
+                ticker=str(ev.get("symbol", "")),
+                quantity=(float(ev["quantity"])
+                          if ev.get("quantity") is not None else None),
+                dollar_val=(float(ev["dollar_val"])
+                            if ev.get("dollar_val") is not None else None),
+                reason=str(ev.get("reason", ""))[:1000],
+                success=(ev.get("kind") == "exit"),
+            )
+        elif tag == "FLATTEN" and ev.get("kind") == "note":
+            # cancellation notes during flatten matter enough to ping
+            send_discord_alert(
+                action="SELL", ticker=str(ev.get("symbol", "PORTFOLIO")),
+                quantity=None, dollar_val=None,
+                reason=str(ev.get("reason", ""))[:1000], success=True)
 
 
 def execute_in_process(signal: Dict[str, object]) -> bool:
@@ -195,22 +233,11 @@ def main() -> None:
     now = datetime.now(tz=ZoneInfo(config.TIMEZONE))
     if exits.should_flatten(now):
         logger.info("At/after %s ET — close-out flatten.", config.FLATTEN_TIME)
-        actions = exits.flatten_all()
-        for line in actions:
-            logger.info("FLATTEN: %s", line)
-        if actions:
-            send_discord_alert(
-                action="SELL", ticker="PORTFOLIO", quantity=None,
-                dollar_val=None,
-                reason=("11:00 close-out flatten: "
-                        + " | ".join(actions))[:1000], success=True)
-        else:
-            logger.info("Nothing open — no flatten needed.")
+        _report_events(exits.flatten_all(), "FLATTEN")
         return
 
     # --- Exit monitor: deterministic stop/target check before new entries ---
-    for line in exits.monitor_once():
-        logger.info("EXIT MONITOR: %s", line)
+    _report_events(exits.monitor_once(), "EXIT MONITOR")
 
     watchlist: List[str] = get_daily_dynamic_watchlist()
     logger.info("Watchlist: %s", watchlist)
@@ -294,8 +321,7 @@ def main() -> None:
 if __name__ == "__main__":
     if "--flatten" in sys.argv:
         print("Manual flatten requested (deterministic, no LLM):")
-        for line in exits.flatten_all():
-            print(" ", line)
+        _report_events(exits.flatten_all(), "FLATTEN")
         raise SystemExit(0)
     if "--selftest" in sys.argv or os.environ.get("SCANNER_SELFTEST", "") == "1":
         raise SystemExit(_selftest())

@@ -408,30 +408,34 @@ async def _attach_protections(signal: Dict[str, Any]) -> str:
             f"monitor/flatten)")
 
 
-async def _monitor_once() -> List[str]:
+async def _monitor_once() -> List[Dict[str, Any]]:
     """
     One pass per open position, in priority order:
       1. Hard exit  — last price breached the ACTIVE stop or the target →
                       market-close, cancel leftover resting orders.
       2. Ratchet    — profit crossed the breakeven/trail thresholds →
                       cancel + re-place the resting stop tighter.
+    Returns structured events (kind: exit|ratchet|note) so the scanner can
+    log AND Discord-ping them; exits are always action=SELL (long exits).
     The resting stop order on the broker is the source of truth (stateless,
     crash-safe); when no resting stop exists, fall back to the computed
     initial bracket from cost.
     """
-    actions: List[str] = []
+    events: List[Dict[str, Any]] = []
     async with executor_session() as session:
         account = await _get_account_number(session)
         open_orders = await _get_open_orders(session, account)
         for pos in await _get_positions(session, account):
             symbol, qty, cost = pos["symbol"], pos["quantity"], pos["avg_cost"]
             if not cost:
-                actions.append(f"{symbol}: no avg cost — skipping monitor")
+                events.append({"kind": "note", "symbol": symbol,
+                               "reason": "no avg cost — skipping monitor"})
                 continue
             side = "BUY"  # pipeline is long-only in practice
             last = await _get_quote(session, symbol)
             if not last:
-                actions.append(f"{symbol}: no quote — skipping this pass")
+                events.append({"kind": "note", "symbol": symbol,
+                               "reason": "no quote — skipping this pass"})
                 continue
 
             resting_stop = next(
@@ -450,11 +454,17 @@ async def _monitor_once() -> List[str]:
                 close_resp = await _place(
                     session, account, symbol=symbol, side="sell",
                     type="market", quantity=str(qty), time_in_force="gfd")
-                actions.append(f"{symbol}: CLOSED — {reason} | {close_resp[:120]}")
+                events.append({
+                    "kind": "exit", "symbol": symbol, "action": "SELL",
+                    "quantity": qty, "price": last,
+                    "dollar_val": round(qty * last, 2), "reason": reason,
+                    "detail": close_resp[:120]})
                 for o in await _get_open_orders(session, account, symbol):
-                    cancel_resp = await _cancel(session, account, o["order_id"])
-                    actions.append(f"{symbol}: canceled resting {o['type']} "
-                                   f"{o['order_id'][:8]} | {cancel_resp[:80]}")
+                    await _cancel(session, account, o["order_id"])
+                    events.append({
+                        "kind": "note", "symbol": symbol,
+                        "reason": f"canceled resting {o['type']} "
+                                  f"{o['order_id'][:8]}"})
                 continue
 
             # --- Ratchet: tighten the resting stop if policy says so ------
@@ -465,36 +475,54 @@ async def _monitor_once() -> List[str]:
                 await _cancel(session, account, resting_stop["order_id"])
             qty_whole = math.floor(qty)
             if qty_whole < 1:
-                actions.append(f"{symbol}: ratchet wanted stop {new_stop} "
-                               f"but no whole shares to protect — monitor "
-                               f"hard-exit check remains active")
+                events.append({
+                    "kind": "note", "symbol": symbol,
+                    "reason": f"ratchet wanted stop {new_stop} but no whole "
+                              f"shares to protect — hard-exit check active"})
                 continue
             resp = await _place(
                 session, account, symbol=symbol, side="sell",
                 type="stop_market", quantity=str(qty_whole),
                 stop_price=_fmt_price(new_stop), time_in_force="gtc")
-            actions.append(f"{symbol}: stop ratcheted {active_stop} → "
-                           f"{new_stop} | {resp[:100]}")
-    return actions
+            events.append({
+                "kind": "ratchet", "symbol": symbol, "action": "SELL",
+                "quantity": qty_whole,
+                "reason": f"stop ratcheted {active_stop} → {new_stop}",
+                "detail": resp[:100]})
+    return events
 
 
-async def _flatten_all() -> List[str]:
-    """Close every open position at market; cancel all resting orders."""
-    actions: List[str] = []
+def render_event(ev: Dict[str, Any]) -> str:
+    """One-line human rendering for logs."""
+    base = f"{ev.get('symbol', '')}: [{ev['kind']}] {ev.get('reason', '')}"
+    return f"{base} | {ev['detail']}" if ev.get("detail") else base
+
+
+async def _flatten_all() -> List[Dict[str, Any]]:
+    """Close every open position at market; cancel all resting orders.
+    Emits the same structured events as the monitor (exits = SELL)."""
+    events: List[Dict[str, Any]] = []
     async with executor_session() as session:
         account = await _get_account_number(session)
         for o in await _get_open_orders(session, account):
-            resp = await _cancel(session, account, o["order_id"])
-            actions.append(f"canceled {o['type']} {o['symbol']} "
-                           f"{o['order_id'][:8]} | {resp[:80]}")
+            await _cancel(session, account, o["order_id"])
+            events.append({"kind": "note", "symbol": o["symbol"],
+                           "reason": f"canceled {o['type']} "
+                                     f"{o['order_id'][:8]}"})
         for pos in await _get_positions(session, account):
+            last = await _get_quote(session, pos["symbol"])
             resp = await _place(
                 session, account, symbol=pos["symbol"], side="sell",
                 type="market", quantity=str(pos["quantity"]),
                 time_in_force="gfd")
-            actions.append(f"flatten {pos['symbol']} "
-                           f"({pos['quantity']:g} sh) | {resp[:120]}")
-    return actions
+            events.append({
+                "kind": "exit", "symbol": pos["symbol"], "action": "SELL",
+                "quantity": pos["quantity"], "price": last,
+                "dollar_val": (round(pos["quantity"] * last, 2)
+                               if last else None),
+                "reason": f"{config.FLATTEN_TIME} ET flatten",
+                "detail": resp[:120]})
+    return events
 
 
 # ---------------------------------------------------------------------------
@@ -516,17 +544,17 @@ def attach_protections(signal: Dict[str, Any]) -> str:
         return f"protection attachment FAILED: {exc}"
 
 
-def monitor_once() -> List[str]:
+def monitor_once() -> List[Dict[str, Any]]:
     try:
         return asyncio.run(_monitor_once())
     except Exception as exc:  # noqa: BLE001
         logger.exception("exit monitor failed")
-        return [f"exit monitor FAILED: {exc}"]
+        return [{"kind": "note", "reason": f"exit monitor FAILED: {exc}"}]
 
 
-def flatten_all() -> List[str]:
+def flatten_all() -> List[Dict[str, Any]]:
     try:
         return asyncio.run(_flatten_all())
     except Exception as exc:  # noqa: BLE001
         logger.exception("flatten failed")
-        return [f"flatten FAILED: {exc}"]
+        return [{"kind": "note", "reason": f"flatten FAILED: {exc}"}]
