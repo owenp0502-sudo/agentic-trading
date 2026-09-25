@@ -73,6 +73,18 @@ MAX_ACTIVE_POSITIONS: int = 1          # One position at a time
 MIN_TRADE_NOTIONAL: float = 1.0        # Robinhood minimum order value ($)
 
 # ---------------------------------------------------------------------------
+# Exit strategy (deterministic — the LLM never sets exit levels)
+# ---------------------------------------------------------------------------
+# Bracket around average cost: stop = cost ± STOP_LOSS_PCT, target =
+# cost ± STOP_LOSS_PCT × TAKE_PROFIT_R (a 2R target by default).
+STOP_LOSS_PCT: float = 0.005           # 0.5% adverse move from cost
+TAKE_PROFIT_R: float = 2.0             # target = 2× the stop distance
+# Time (America/New_York, zero-padded HH:MM) at/after which the close-out run
+# flattens every open position and cancels resting orders. The 11:00 and
+# 11:05 crons enforce it; stops are also resting GTC broker-side.
+FLATTEN_TIME: str = "11:00"
+
+# ---------------------------------------------------------------------------
 # Session window (all logic uses America/New_York; never local machine time)
 # ---------------------------------------------------------------------------
 TIMEZONE: str = "America/New_York"

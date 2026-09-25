@@ -15,6 +15,10 @@ on:
         description: "Synthetic end-to-end selftest (no session gate)"
         type: boolean
         default: false
+      flatten:
+        description: "Flatten all positions + cancel resting orders (no scan)"
+        type: boolean
+        default: false
   schedule:
     - cron: '*/5 9-10 * * 1-5'
       timezone: "America/New_York"
@@ -61,8 +65,11 @@ jobs:
           ALPACA_PAPER: "paper"
           EXECUTOR_DRY_RUN: "1"
           SCANNER_SELFTEST: ${{ inputs.selftest }}
+          SCANNER_FLATTEN: ${{ inputs.flatten }}
         run: |
-          if [ "$SCANNER_SELFTEST" = "true" ] || [ "$SCANNER_SELFTEST" = "1" ]; then
+          if [ "$SCANNER_FLATTEN" = "true" ] || [ "$SCANNER_FLATTEN" = "1" ]; then
+            python scanner.py --flatten
+          elif [ "$SCANNER_SELFTEST" = "true" ] || [ "$SCANNER_SELFTEST" = "1" ]; then
             python scanner.py --selftest
           else
             python scanner.py

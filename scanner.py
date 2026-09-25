@@ -16,11 +16,14 @@ deliberately for a real end-to-end placement.
 import logging
 import os
 import sys
+from datetime import datetime
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 import config
+import exits
 from discord_notify import send_discord_alert
 from screener import get_daily_dynamic_watchlist
 from strategy import evaluate_tjr_setup
@@ -111,11 +114,18 @@ def execute_in_process(signal: Dict[str, object]) -> bool:
 
     ok, report = executor_core.execute_signal(signal)
     logger.info("Execution result ok=%s report=%s", ok, report[:200])
+    alert_reason = report if ok else f"EXECUTION FAILED: {report}"
+    if ok:
+        # Deterministic bracket: resting stop (GTC) + target (GFD), sized to
+        # whole shares (fractional remainder is handled by monitor/flatten).
+        prot = exits.attach_protections(signal)
+        logger.info("Protections: %s", prot)
+        alert_reason = f"{report} | {prot}"[:1000]
     send_discord_alert(
         action=str(signal["action"]), ticker=str(signal["ticker"]),
         quantity=float(signal["quantity"]),
         dollar_val=float(signal["dollar_val"]),
-        reason=(report if ok else f"EXECUTION FAILED: {report}")[:1000],
+        reason=alert_reason,
         success=ok,
     )
     return ok
@@ -179,6 +189,28 @@ def main() -> None:
     if not config.GEMINI_API_KEY:
         logger.error("GEMINI_API_KEY not set — cannot execute signals.")
         return
+
+    # --- Close-out: at/after FLATTEN_TIME (11:00 ET) flatten everything ---
+    # (The 11:00 and 11:05 crons land here; also any manual run late.)
+    now = datetime.now(tz=ZoneInfo(config.TIMEZONE))
+    if exits.should_flatten(now):
+        logger.info("At/after %s ET — close-out flatten.", config.FLATTEN_TIME)
+        actions = exits.flatten_all()
+        for line in actions:
+            logger.info("FLATTEN: %s", line)
+        if actions:
+            send_discord_alert(
+                action="SELL", ticker="PORTFOLIO", quantity=None,
+                dollar_val=None,
+                reason=("11:00 close-out flatten: "
+                        + " | ".join(actions))[:1000], success=True)
+        else:
+            logger.info("Nothing open — no flatten needed.")
+        return
+
+    # --- Exit monitor: deterministic stop/target check before new entries ---
+    for line in exits.monitor_once():
+        logger.info("EXIT MONITOR: %s", line)
 
     watchlist: List[str] = get_daily_dynamic_watchlist()
     logger.info("Watchlist: %s", watchlist)
@@ -256,6 +288,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if "--flatten" in sys.argv:
+        print("Manual flatten requested (deterministic, no LLM):")
+        for line in exits.flatten_all():
+            print(" ", line)
+        raise SystemExit(0)
     if "--selftest" in sys.argv or os.environ.get("SCANNER_SELFTEST", "") == "1":
         raise SystemExit(_selftest())
     main()

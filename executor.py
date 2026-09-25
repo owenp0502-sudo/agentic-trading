@@ -96,17 +96,24 @@ async def _mcp_session() -> AsyncIterator[Any]:
 
 
 async def _fetch_account_state() -> Dict[str, Optional[float]]:
-    """Read cash + open equity positions via MCP (read-only tools)."""
+    """Read cash + open equity positions via MCP (read-only tools).
+
+    Position tools require an explicit account_number, resolved
+    deterministically from get_accounts (exits.parse_account_number).
+    """
+    from exits import parse_account_number, parse_positions
+
     async with _mcp_session() as session:
-
-        async def _call(name: str, arguments: Dict[str, Any]) -> str:
-            res = await session.call_tool(name, arguments)
-            return "\n".join(
-                getattr(c, "text", "") for c in (res.content or [])
-                if getattr(c, "text", None))
-
-        accounts_raw = await _call("get_accounts", {})
-        positions_raw = await _call("get_equity_positions", {})
+        accounts_raw = await _call_tool(
+            session, "get_accounts", {})
+        account_number = parse_account_number(accounts_raw)
+        if not account_number:
+            logger.error("could not resolve agentic account number")
+            return {"cash": None, "open_positions": None,
+                    "account_number": None}
+        positions_raw = await _call_tool(
+            session, "get_equity_positions",
+            {"account_number": account_number})
 
     cash: Optional[float] = None
     # Pull every JSON object out of the tool text and hunt for cash-like fields
@@ -132,20 +139,16 @@ async def _fetch_account_state() -> Dict[str, Optional[float]]:
         if cash is not None:
             break
 
-    open_count: Optional[int] = None
-    if positions_raw.strip():
-        try:
-            parsed = json.loads(positions_raw)
-            items = parsed if isinstance(parsed, list) else (
-                parsed.get("positions") or parsed.get("results") or [])
-            if isinstance(items, list):
-                open_count = len(items)
-        except json.JSONDecodeError:
-            open_count = 0 if not positions_raw.strip() else None
-    else:
-        open_count = 0
+    open_count = len(parse_positions(positions_raw))
+    return {"cash": cash, "open_positions": open_count,
+            "account_number": account_number}
 
-    return {"cash": cash, "open_positions": open_count}
+
+async def _call_tool(session: Any, name: str, args: Dict[str, Any]) -> str:
+    res = await session.call_tool(name, args)
+    return "\n".join(
+        getattr(c, "text", "") for c in (res.content or [])
+        if getattr(c, "text", None))
 
 
 async def _run_mcp_trade(prompt: str) -> str:
@@ -229,8 +232,12 @@ def execute_signal(signal: Dict[str, Any]) -> Tuple[bool, str]:
         return False, f"SKIPPED: {reason}"
 
     # --- 2. LLM orchestration (numbers are final; model just places it) ---
+    account_number = state.get("account_number") or "(the single agentic " \
+        "account returned by get_accounts — pass its account_number " \
+        "explicitly)"
     prompt = (
         "Trade card (do not modify any value):\n"
+        f"account_number: {account_number}\n"
         f"ticker: {ticker}\n"
         f"side: {action.lower()}\n"
         f"quantity: {quantity} (fractional shares)\n"
@@ -238,7 +245,8 @@ def execute_signal(signal: Dict[str, Any]) -> Tuple[bool, str]:
         "Steps: 1) Fetch the account cash balance via the Robinhood MCP tool. "
         "2) Verify the total dollar value is <= 10% of that cash balance. "
         "3) If valid, place the order via place_equity_order exactly as "
-        "specified. 4) Report the order status."
+        "specified (type=market, time_in_force=gfd, regular_hours). "
+        "4) Report the order status."
     )
     try:
         report = asyncio.run(_run_mcp_trade(prompt))
