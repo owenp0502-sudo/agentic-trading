@@ -76,6 +76,21 @@ curl http://localhost:10000/health
   runner predates it, switch the cron to UTC: `*/5 13-14 * * 1-5` + `0 15`.
 - Gemini's MCP tool-loop requires the async client (`client.aio`) — handled.
 
+## Robinhood Trading MCP — one-time auth bootstrap
+
+The official endpoint (`agent.robinhood.com/mcp/trading`) is OAuth-protected
+and trades only inside a dedicated **Agentic account** you open during
+consent (desktop browser required by Robinhood).
+
+```bash
+python robinhood_auth.py   # opens browser → approve → paste redirect URL
+```
+
+That saves tokens locally (~/.tjr_bot/robinhood_tokens.json), proves the
+connection by listing the MCP tools, and prints a JSON blob for Render:
+paste it as the `ROBINHOOD_TOKEN_STORE_JSON` env var. Refreshes are handled
+automatically at runtime; re-run the bootstrap only if consent is revoked.
+
 ## ⚠️ Risk notes (read the vault's 03 Risk Register)
 
 - Robinhood MCP automation sits in a ToS gray zone — keep size small; the

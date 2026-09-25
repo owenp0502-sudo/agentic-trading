@@ -57,30 +57,38 @@ def _build_gemini_client() -> "Any":
 
 async def _run_mcp_trade(prompt: str) -> str:
     """
-    Open the Robinhood MCP session (streamable HTTP), hand it to Gemini
-    2.5 Flash as a tool binding, and let the model drive the order through
-    `place_equity_order`. Returns the model's final text report.
+    Open the Robinhood MCP session (streamable HTTP over an OAuth-
+    authenticated client), hand it to Gemini Flash as a tool binding, and
+    let the model drive the order through `place_equity_order`.
+    Returns the model's final text report.
     """
     from google.genai import types
     from mcp import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
+    from mcp.client.streamable_http import streamable_http_client
+    from robinhood_auth import (MCP_SERVER_URL,
+                                make_authenticated_http_client)
 
-    async with streamablehttp_client(
-        config.ROBINHOOD_MCP_URL, headers=config.ROBINHOOD_MCP_HEADERS or None
-    ) as (read_stream, write_stream, _):
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()  # MCP handshake
+    http = await make_authenticated_http_client()
+    try:
+        async with streamable_http_client(
+            config.ROBINHOOD_MCP_URL or MCP_SERVER_URL, http_client=http
+        ) as streams:
+            read_stream, write_stream = streams[0], streams[1]
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()  # MCP handshake (auth auto-refreshes)
 
-            client = _build_gemini_client()
-            response = await client.aio.models.generate_content(
-                model=config.GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=EXECUTOR_SYSTEM_INSTRUCTION,
-                    tools=[types.Tool(mcp_client=session)],  # MCP → Gemini tools
-                ),
-            )
-            return response.text or "(empty model response)"
+                client = _build_gemini_client()
+                response = await client.aio.models.generate_content(
+                    model=config.GEMINI_MODEL,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=EXECUTOR_SYSTEM_INSTRUCTION,
+                        tools=[types.Tool(mcp_client=session)],  # MCP → Gemini
+                    ),
+                )
+                return response.text or "(empty model response)"
+    finally:
+        await http.aclose()
 
 
 def execute_via_gemini_mcp(signal: Dict[str, Any]) -> Tuple[bool, str]:
@@ -133,6 +141,14 @@ def execute() -> Tuple[Any, int]:
 
     if action not in {"BUY", "SELL"} or quantity <= 0 or dollar_val <= 0:
         return jsonify({"error": "invalid action/quantity/dollar_val"}), 400
+
+    signal = {
+        "ticker": ticker,
+        "action": action,
+        "quantity": quantity,
+        "dollar_val": dollar_val,
+        "reason": str(payload.get("reason", "")),
+    }
 
     # 2. Duplicate-signal guard (GitHub Actions can double-fire).
     key = (ticker, action, round(dollar_val, 2))

@@ -1,6 +1,6 @@
 flask>=3.0
 google-genai>=1.0,<3.0
-mcp>=1.2
+mcp>=2.0
 requests>=2.31
 alpaca-py>=0.36
 # Spec-listed but currently unused (SMC math lives in strategy.py) — safe to prune:
