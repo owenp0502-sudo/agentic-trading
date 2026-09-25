@@ -32,8 +32,10 @@ call and reports back.
    `DISCORD_WEBHOOK_URL`. For push pings, enable Developer Mode and copy your
    **numeric** user ID → `DISCORD_USER_ID`.
 4. **Render** — new Web Service from this repo:
-   - Build: `pip install -r requirements.txt`
-   - Start: `gunicorn server:app`
+   - Start: `gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 300`
+     (Render requires binding to its injected `$PORT`; the long timeout
+     accommodates the Gemini + MCP round trip)
+   - Health Check Path: `/health`
    - Env vars: `GEMINI_API_KEY`, `DISCORD_WEBHOOK_URL`, `DISCORD_USER_ID`,
      `WEBHOOK_PASSPHRASE`, `ROBINHOOD_MCP_URL`, `ROBINHOOD_MCP_HEADERS`,
      Alpaca keys (for the server-side 10% pre-check).

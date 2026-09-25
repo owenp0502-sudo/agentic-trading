@@ -40,6 +40,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Warm up Render service (cold-start guard)
+        env:
+          RENDER_WEBHOOK_URL: ${{ secrets.RENDER_WEBHOOK_URL }}
+        run: |
+          if [ -n "$RENDER_WEBHOOK_URL" ]; then
+            # Free-tier instances sleep after ~15 min idle; first hit wakes
+            # them (~50s). This ping absorbs that latency before real
+            # signals arrive, making UptimeRobot effectively optional.
+            curl -s --max-time 90 "$RENDER_WEBHOOK_URL/health" || true
+          else
+            echo "RENDER_WEBHOOK_URL secret not set — skipping warmup"
+          fi
+
       - name: Run scanner
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
