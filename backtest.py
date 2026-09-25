@@ -134,7 +134,29 @@ def _simulate_long(bars: pd.DataFrame, sig_idx: int, sweep_level: Optional[float
 
 
 def run(days: int, symbols: List[str], equity: float, allow_shorts: bool,
-        slip_bps: float) -> None:
+        slip_bps: float, session_start: Optional[str] = None,
+        session_end: Optional[str] = None, no_fvg: bool = False,
+        max_stop_pct: Optional[float] = None) -> None:
+    # Optional experiment overrides (restored after the run)
+    saved = (config.SESSION_START, config.SESSION_END, config.FVG_REQUIRED,
+             config.MAX_STOP_DISTANCE_PCT)
+    if session_start:
+        config.SESSION_START = session_start
+    if session_end:
+        config.SESSION_END = session_end
+    if no_fvg:
+        config.FVG_REQUIRED = False
+    if max_stop_pct is not None:
+        config.MAX_STOP_DISTANCE_PCT = max_stop_pct
+    try:
+        _run_inner(days, symbols, equity, allow_shorts, slip_bps)
+    finally:
+        (config.SESSION_START, config.SESSION_END, config.FVG_REQUIRED,
+         config.MAX_STOP_DISTANCE_PCT) = saved
+
+
+def _run_inner(days: int, symbols: List[str], equity: float,
+               allow_shorts: bool, slip_bps: float) -> None:
     client = _alpaca_client()
     slip = slip_bps / 10_000.0
     today = datetime.now(tz=NY_TZ).replace(hour=12, minute=0,
@@ -261,6 +283,21 @@ if __name__ == "__main__":
                     help="also collect SELL setups (still simulated long-only)")
     ap.add_argument("--slippage-bps", type=float, default=0.0,
                     help="round-trip slippage in basis points (e.g. 2)")
+    ap.add_argument("--no-fvg", action="store_true",
+                    help="run the sweep→MSS variant (skip the FVG checklist "
+                         "item) for frequency comparison")
+    ap.add_argument("--session-start", type=str, default=None,
+                    help="override session start HH:MM ET (e.g. 09:30)")
+    ap.add_argument("--session-end", type=str, default=None,
+                    help="override session end HH:MM ET (e.g. 16:00 — "
+                         "last entry must still respect --flatten-time")
+    ap.add_argument("--flatten-time", type=str, default=None,
+                    help="override close-out time HH:MM ET")
+    ap.add_argument("--max-stop-pct", type=float, default=None,
+                    help="override the structural stop clamp, e.g. 0.03")
     args = ap.parse_args()
+    if args.flatten_time:
+        config.FLATTEN_TIME = args.flatten_time
     run(args.days, [s.upper() for s in args.symbols], args.equity,
-        args.allow_shorts, args.slippage_bps)
+        args.allow_shorts, args.slippage_bps, args.session_start,
+        args.session_end, args.no_fvg, args.max_stop_pct)

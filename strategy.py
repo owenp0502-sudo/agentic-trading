@@ -232,10 +232,12 @@ def evaluate_tjr_setup(df: pd.DataFrame) -> Dict[str, object]:
     direction = sweep_dir
 
     # --- Check 4: FVG in the displacement leg -----------------------------
+    # FVG_REQUIRED=0 trades the sweep→MSS sequence alone (frequency over
+    # confirmation quality — backtest before enabling in production).
     fvg_ok, fvg_price = _find_fvg(df, direction, sweep_pos, price)
     checks["fvg"] = fvg_ok
     checks["fvg_price"] = round(fvg_price, 4) if fvg_price is not None else None
-    if not fvg_ok:
+    if config.FVG_REQUIRED and not fvg_ok:
         return invalid
 
     result: Dict[str, object] = {

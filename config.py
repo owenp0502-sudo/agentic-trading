@@ -93,6 +93,12 @@ MIN_TRADE_NOTIONAL: float = 1.0        # Robinhood minimum order value ($)
 STOP_LOSS_PCT: float = _get_env_float("STOP_LOSS_PCT", 0.005)   # 0.5%
 TAKE_PROFIT_R: float = _get_env_float("TAKE_PROFIT_R", 2.0)     # 2R target
 
+# Require the FVG checklist item. Turning it off trades the sweep→MSS
+# sequence alone (higher frequency, unproven quality — backtest first:
+#   python backtest.py --no-fvg --days 20
+FVG_REQUIRED: bool = _get_env(
+    "FVG_REQUIRED", "1").lower() not in ("0", "false", "no")
+
 # Anchor the stop to the sweep level (TJR structure) when the scanner
 # provides one: just beyond the swept extreme, with the distance clamped
 # to [MIN, MAX] % of cost so noise can't stop us out and tails are bounded.
