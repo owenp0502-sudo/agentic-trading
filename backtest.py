@@ -242,6 +242,7 @@ def _simulate_long(bars: pd.DataFrame, sig_idx: int, sweep_level: Optional[float
 
     exit_price: Optional[float] = None
     reason, exit_ts = None, None
+    bars_held = 0
     for j in range(sig_idx + 1, len(bars)):
         bar = bars.iloc[j]
         ts = bar.name.to_pydatetime()
@@ -256,6 +257,12 @@ def _simulate_long(bars: pd.DataFrame, sig_idx: int, sweep_level: Optional[float
             break
         if high >= target:
             exit_price, reason, exit_ts = target * (1 - slip), "TARGET", ts
+            break
+        bars_held += 1
+        # Time stop: flat position after N bars exits on this bar's close.
+        if config.TIME_STOP_BARS and bars_held >= config.TIME_STOP_BARS:
+            exit_price, reason, exit_ts = close * (1 - slip), \
+                f"TIME-{config.TIME_STOP_BARS}", ts
             break
         new_stop = exits.trailed_stop("BUY", entry, stop, close)
         if new_stop is not None:
@@ -279,11 +286,14 @@ def run(days: int, symbols: List[str], equity: float, allow_shorts: bool,
         session_end: Optional[str] = None, no_fvg: bool = False,
         max_stop_pct: Optional[float] = None,
         arm_bars: Optional[int] = None, freq: str = "5min",
-        refresh: bool = False, vol_mult: Optional[float] = None) -> None:
+        refresh: bool = False, vol_mult: Optional[float] = None,
+        tp_r: Optional[float] = None,
+        time_stop_bars: Optional[int] = None) -> None:
     # Optional experiment overrides (restored after the run)
     saved = (config.SESSION_START, config.SESSION_END, config.FVG_REQUIRED,
              config.MAX_STOP_DISTANCE_PCT, config.SWEEP_ARM_BARS,
-             config.VOLUME_CONFIRM, config.VOL_MULT)
+             config.VOLUME_CONFIRM, config.VOL_MULT,
+             config.TAKE_PROFIT_R, config.TIME_STOP_BARS)
     if session_start:
         config.SESSION_START = session_start
     if session_end:
@@ -297,13 +307,18 @@ def run(days: int, symbols: List[str], equity: float, allow_shorts: bool,
     if vol_mult is not None:  # enabling a multiplier turns the filter on
         config.VOLUME_CONFIRM = True
         config.VOL_MULT = vol_mult
+    if tp_r is not None:
+        config.TAKE_PROFIT_R = tp_r
+    if time_stop_bars is not None:
+        config.TIME_STOP_BARS = time_stop_bars
     try:
         _run_inner(days, symbols, equity, allow_shorts, slip_bps, freq,
                    refresh)
     finally:
         (config.SESSION_START, config.SESSION_END, config.FVG_REQUIRED,
          config.MAX_STOP_DISTANCE_PCT, config.SWEEP_ARM_BARS,
-         config.VOLUME_CONFIRM, config.VOL_MULT) = saved
+         config.VOLUME_CONFIRM, config.VOL_MULT,
+         config.TAKE_PROFIT_R, config.TIME_STOP_BARS) = saved
 
 
 def _run_inner(days: int, symbols: List[str], equity: float,
@@ -461,10 +476,15 @@ if __name__ == "__main__":
     ap.add_argument("--vol-mult", type=float, default=None,
                     help="volume confirmation: trigger bar must be N× the "
                          "prior-20-bar mean volume (e.g. 1.5)")
+    ap.add_argument("--tp-r", type=float, default=None,
+                    help="override TAKE_PROFIT_R (e.g. 1.0 for 1R targets)")
+    ap.add_argument("--time-stop", type=int, default=None,
+                    help="exit flat positions after N bars (0 = hold to "
+                         "flatten, the default)")
     args = ap.parse_args()
     if args.flatten_time:
         config.FLATTEN_TIME = args.flatten_time
     run(args.days, [s.upper() for s in args.symbols], args.equity,
         args.allow_shorts, args.slippage_bps, args.session_start,
         args.session_end, args.no_fvg, args.max_stop_pct, args.arm_bars,
-        args.freq, args.refresh, args.vol_mult)
+        args.freq, args.refresh, args.vol_mult, args.tp_r, args.time_stop)

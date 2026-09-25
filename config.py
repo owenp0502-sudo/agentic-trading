@@ -137,6 +137,12 @@ MAX_STOP_DISTANCE_PCT: float = 0.02          # 2.0% — tail-risk bound
 TRAIL_BREAKEVEN_R: float = _get_env_float("TRAIL_BREAKEVEN_R", 1.0)
 TRAIL_STOP_PCT: float = _get_env_float("TRAIL_STOP_PCT", 0.0)
 
+# Time stop: if the position is still open after TIME_STOP_BARS bars and
+# has not hit stop/target, exit on that bar's close. 0 disables (default:
+# hold to FLATTEN_TIME). Rationale: the signal book's winners historically
+# decay into flatten-time exits — see README research log.
+TIME_STOP_BARS: int = _get_env_int("TIME_STOP_BARS", 0)
+
 # Time (America/New_York, HH:MM) at/after which the close-out run flattens
 # every open position and cancels resting orders (11:00 + 11:05 crons).
 FLATTEN_TIME: str = _get_env("FLATTEN_TIME", "11:00")

@@ -294,6 +294,36 @@ universe/timeframe. The signal itself (sweep→MSS→FVG at 5m on liquid
 US equities, Jul–Sep 2026) does not carry edge as encoded. Further work
 needs different signal logic or different markets — not more filters.
 
+### Sep 25, 2026 (final) — exit-policy grid + signal inversion: win% is buyable, profit is not
+
+Method: fixed the 82-signal book (both universes, extended session),
+grid-searched exit policy over 24 configurations (TP ∈ {1.0, 1.5, 2.0}R ×
+breakeven ∈ {off, +1R} × time-stop ∈ {none, 6, 12, 24} bars), tuned on the
+first 30 days, validated on the last 30 (IS/OOS split at 2026-08-26).
+Shipped `TIME_STOP_BARS` (default 0 = off) and `--tp-r` / `--time-stop`
+flags for this. All 24 configs were **negative out-of-sample** (PF 0.02–
+0.59). Best OOS win%: TP=1R + breakeven + 6-bar time-stop → **36%** (vs
+20–29% elsewhere) and the smallest OOS loss (−$43 vs −$102 at defaults).
+
+Inversion test (fade every signal: short after a BUY displacement, via a
+price-mirrored frame so all tested bracket/trail logic applies):
+**flat after costs** (win 0–8%, avg −0.07R ≈ slippage only, IS and OOS
+alike). The original signal loses ~−0.45R/trade; its inverse loses only
+costs — i.e. the entries have mildly *negative* edge, and no exploitable
+symmetry exists.
+
+**Final reading of the request “improve win% by any means”:**
+- Achievable: win% 27% → 36% OOS with TP=1R + breakeven + 6-bar time-stop
+  (`--tp-r 1.0 --time-stop 6`), which also cuts OOS losses ~60%. Shipped
+  as *knobs*, not defaults — choosing them because they won OOS would be
+  curve-fitting the validation set with n=28.
+- Not achievable honestly: positive expectancy from this checklist in
+  this regime. Five structural levers, 24 exit configs, and the inverted
+  book all confirm it.
+- `EXECUTOR_DRY_RUN=1` stays until a *different signal* clears PF ≈1.3
+  over 30+ verified trades. The execution stack, guardrails, and this
+  backtester are ready for that signal the day one is found.
+
 ## Known deviations from the original spec
 
 - `yfinance` / `smartmoneyconcepts` are listed per spec but currently unused
