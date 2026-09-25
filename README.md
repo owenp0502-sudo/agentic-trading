@@ -184,6 +184,47 @@ are `EOD-DATA`: the data slice ends before the flatten bar prints.)
 5. Every future study must use the per-day slice + byte-verification
    protocol before results are recorded here.
 
+### Sep 25, 2026 (later still) — protocol hardened into backtest.py; baseline re-validated
+
+The data-integrity protocol is no longer a manual procedure — it is
+enforced by `backtest.py` itself (commit `d66be7d`):
+
+- shared normalize/resample layer: bulk fetch and the validated per-day
+  fetch path produce identical frames **by construction**
+- per-symbol-day slicing (07:00–16:00 ET) before resampling *and* before
+  context windowing — cross-session context cannot exist in the data model
+- byte-verification (`assert_frame_equal` vs `_fetch_day`) on every
+  dataset build **and every cache load**; mismatches print the failing
+  symbol/day/shape and hard-abort
+- tz-aware request bounds (naive bounds were silently truncating
+  afternoon data — surfaced as `EOD-DATA` exits where FLATTEN exits
+  belonged)
+- bulk fetches retry with backoff; a symbol yielding zero bars aborts
+  the run instead of silently halving the sample
+- in-loop assertion: every context window must span exactly one date
+- `--freq 5min|15min` and `--refresh` flags; cache key covers
+  symbols+span+freq
+
+**Re-validation run** (60 days × 12 symbols, extended 09:30–15:55,
+arm=5, 2bps slippage, one command, reproducible):
+
+```
+dataset verified vs _fetch_day (3 samples) OK
+528 symbol-days → 11 trades, win 36%, avg −0.03R, PF 1.02, P&L +$1.22
+```
+
+Matches the verified v2 harness exactly. **This is the first honest
+full-sample read of the strict strategy: roughly break-even (PF 1.02
+over 11 trades is a coin flip, not alpha).** Exit mix: 3 STOP / 8
+FLATTEN, zero 2R targets reached.
+
+**Standing summary of all studies to date:** the execution stack is
+verified sound; the strategy, as strictly encoded, is rare and
+unproven. Parameter relaxation (arm, FVG gate, timeframe) has been
+tested and rejected every time. The untested directions are universe
+(high-beta names where displacement is common) and signal redesign
+(stateful two-stage logic survives as a knob, not a proven win).
+
 ## Known deviations from the original spec
 
 - `yfinance` / `smartmoneyconcepts` are listed per spec but currently unused
