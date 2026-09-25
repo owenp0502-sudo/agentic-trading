@@ -225,6 +225,45 @@ tested and rejected every time. The untested directions are universe
 (high-beta names where displacement is common) and signal redesign
 (stateful two-stage logic survives as a knob, not a proven win).
 
+### Sep 25, 2026 (latest) — universe test: high-beta names, hardened protocol
+
+Hypothesis: the strict sequence is rare on mega-caps because displacement
+is rare there; high-beta names (COIN, MSTR, PLTR, HOOD, SMH, SOFI) should
+produce more valid sweep→MSS→FVG chains. Same protocol, 60 days, arm=5,
+2bps slippage:
+
+| Universe | Config | Trades | Win% | Avg R | PF | P&L |
+|---|---|---|---|---|---|---|
+| Mega-cap 12 (prior) | extended | 11 | 36% | −0.03R | 1.02 | +$1 |
+| **High-beta 6** | **live window** | **0** | — | — | — | $0 |
+| **High-beta 6** | **extended** | **22** | **27%** | **−0.20R** | **0.35** | **−$121** |
+
+**Result: hypothesis rejected.** High-beta doubles signal frequency but
+decimates quality (PF 0.35, 9 of 22 trades stopped at full −1R). More
+volatility ≠ more *valid* TJR sequences — in choppy high-beta tape the
+sequence completes but does not follow through, and the 2R targets are
+never reached. The live-window result is unchanged across universes:
+zero.
+
+**Where this leaves the search.** Every lever in the first hypothesis
+space has now been tested under the verified protocol and rejected:
+parameter relaxation (arm 5→15, FVG off, 5m→15m) and universe (mega-cap
+→ high-beta). The consistent pattern across ~45 verified trades is: the
+checklist fires rarely, its exits cluster at flatten-time rather than
+targets, and nothing beats break-even. Conclusions:
+1. The bot's infrastructure, guardrails, and research pipeline are the
+   durable deliverables — they are sound and reusable for any strategy.
+2. The strict TJR checklist, as encoded, has no demonstrated edge on
+   liquid US equities at 5m/15m over Jul–Sep 2026. That is a finding,
+   not a failure — it was tested honestly.
+3. Remaining directions require *different signal logic*, not parameter
+   tuning: e.g. reversal-flavored exits (the flatten-heavy exit mix hints
+   entries are late in mean-reverting tape), order-flow/volume
+   confirmation, or accepting the dry-run bot as a long-running data
+   collector for regime studies.
+4. Until a strategy shows PF > ~1.3 over 30+ verified trades, keep
+   `EXECUTOR_DRY_RUN=1`.
+
 ## Known deviations from the original spec
 
 - `yfinance` / `smartmoneyconcepts` are listed per spec but currently unused
