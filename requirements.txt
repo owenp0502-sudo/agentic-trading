@@ -1,0 +1,11 @@
+flask>=3.0
+google-genai>=1.0,<3.0
+mcp>=1.2
+requests>=2.31
+alpaca-py>=0.36
+# Spec-listed but currently unused (SMC math lives in strategy.py) — safe to prune:
+yfinance>=0.2.40
+smartmoneyconcepts>=0.0.3
+pandas>=2.0
+python-dotenv>=1.0
+gunicorn>=21.2

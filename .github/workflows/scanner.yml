@@ -1,0 +1,50 @@
+name: TJR SMC Scanner
+
+# Every 5 minutes during the NY Open window (9:30–11:00 AM Eastern),
+# Monday–Friday. Timezone is declared explicitly; the cron runs in that
+# zone (fall back to '*/5 13-14 * * 1-5' UTC if your Actions runner
+# predates timezone support).
+on:
+  workflow_dispatch:      # manual test trigger
+  schedule:
+    - cron: '*/5 9-10 * * 1-5'
+      timezone: "America/New_York"
+    # 11:00 AM close-out run
+    - cron: '0 11 * * 1-5'
+      timezone: "America/New_York"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tjr-scanner
+  cancel-in-progress: false   # never kill a scan mid-run
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          RENDER_WEBHOOK_URL: ${{ secrets.RENDER_WEBHOOK_URL }}
+          WEBHOOK_PASSPHRASE: ${{ secrets.WEBHOOK_PASSPHRASE }}
+          ALPACA_PAPER: "paper"
+        run: python scanner.py
