@@ -48,18 +48,10 @@ EXECUTOR_SYSTEM_INSTRUCTION = (
 # Gemini + Robinhood MCP wiring
 # ---------------------------------------------------------------------------
 def _build_gemini_client() -> "Any":
-    """Create the google-genai client, routing AQ.-prefixed (Vertex express)
-    keys correctly."""
+    """Create the google-genai Developer API client. Both AIza (AI Studio)
+    and AQ. (Vertex express) keys authenticate here — verified 2026-09-25."""
     from google import genai
-    from google.genai import types
 
-    if config.GEMINI_IS_VERTEX:
-        # Vertex AI express-mode key
-        return genai.Client(
-            vertexai=True,
-            api_key=config.GEMINI_API_KEY,
-            http_options=types.HttpOptions(api_version="v1beta1"),
-        )
     return genai.Client(api_key=config.GEMINI_API_KEY)
 
 

@@ -127,17 +127,13 @@ def check_alpaca_screener() -> None:
 
 def check_gemini() -> None:
     key = ENV.get("GEMINI_API_KEY", "")
-    model = ENV.get("GEMINI_MODEL", "gemini-2.5-flash")
+    model = ENV.get("GEMINI_MODEL", "gemini-3.5-flash")
     if not key:
         return report("Gemini", False, "GEMINI_API_KEY missing")
-    if key.startswith("AQ."):
-        url = ("https://aiplatform.googleapis.com/v1/publishers/google/"
-               f"models/{model}:generateContent")
-        headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-    else:
-        url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-               f"{model}:generateContent")
-        headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+    # Both AIza and AQ. (express) keys work on the Developer API endpoint.
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{model}:generateContent")
+    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
     status, body = request("POST", url, headers, {
         "contents": [{"parts": [{"text": "Reply with exactly: OK"}]}],
         "generationConfig": {"maxOutputTokens": 800},

@@ -58,10 +58,10 @@ if _raw_headers:
 # ---------------------------------------------------------------------------
 # Gemini model routing
 # ---------------------------------------------------------------------------
-# Keys starting with "AQ." are Vertex AI express-mode keys; anything else is
-# treated as a Gemini Developer API (AI Studio) key.
-GEMINI_MODEL: str = _get_env("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_IS_VERTEX: bool = GEMINI_API_KEY.startswith("AQ.")
+# NOTE: both AIza (AI Studio) and AQ. (Vertex express) keys work via the
+# Developer API endpoint (generativelanguage.googleapis.com) — verified
+# empirically 2026-09-25. gemini-2.5-flash is retired for new users.
+GEMINI_MODEL: str = _get_env("GEMINI_MODEL", "gemini-3.5-flash")
 
 # ---------------------------------------------------------------------------
 # Risk & sizing constants (hard-coded guardrails — code cannot talk its way
