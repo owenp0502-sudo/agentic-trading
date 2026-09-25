@@ -1,20 +1,23 @@
 """
-server.py — Flask Execution Bridge (Render free tier).
+server.py — Flask Execution Bridge (Render free tier). OPTIONAL.
 
-The executor is a *plumber*, not a trader. Gemini + Robinhood MCP handle
-orchestration only; every number arrives pre-computed from the scanner and
-the 10%-of-cash rule is re-verified in code before any order is attempted.
+The primary pipeline now executes in-process on GitHub Actions (scanner.py →
+executor.py) — same core, no extra hosting. This HTTP wrapper remains for
+manual drills and any future split back to an always-on executor: it is a
+*plumber*, not a trader. Gemini + Robinhood MCP orchestrate; every number
+arrives pre-computed from the scanner, and executor.execute_signal()
+re-verifies the cap / min-notional / one-position rules in code before the
+model sees the card.
 """
 
-import asyncio
 import logging
-import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 from flask import Flask, jsonify, request
 
 import config
 from discord_notify import send_discord_alert
+from executor import execute_signal, mcp_preflight
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,89 +31,6 @@ app = Flask(__name__)
 # guards against GitHub Actions double-fire. Idempotency per risk register.
 _SEEN_SIGNALS: Dict[Tuple[str, str, float], bool] = {}
 
-EXECUTOR_SYSTEM_INSTRUCTION = (
-    "You are a trade execution agent. You receive a JSON trade card and a set "
-    "of Robinhood MCP tools. Your ONLY job is to place the order described, "
-    "via the Robinhood MCP tool `place_equity_order`.\n"
-    "Hard rules you must never break:\n"
-    "1. Execute the order via `place_equity_order` on Robinhood MCP ONLY if "
-    "total dollar value is <= 10% of cash balance.\n"
-    "2. Never modify the ticker, side, quantity, or dollar value. No "
-    "substitutions, no 'better' prices, no rounding.\n"
-    "3. If the dollar value exceeds 10% of the fetched cash balance, place "
-    "NOTHING and reply with the refusal reason.\n"
-    "4. If any tool errors, halt and report the error. Retry at most once.\n"
-    "5. Report the final order status (id, state, filled quantity) as plain text."
-)
-
-
-# ---------------------------------------------------------------------------
-# Gemini + Robinhood MCP wiring
-# ---------------------------------------------------------------------------
-def _build_gemini_client() -> "Any":
-    """Create the google-genai Developer API client. Both AIza (AI Studio)
-    and AQ. (Vertex express) keys authenticate here — verified 2026-09-25."""
-    from google import genai
-
-    return genai.Client(api_key=config.GEMINI_API_KEY)
-
-
-async def _run_mcp_trade(prompt: str) -> str:
-    """
-    Open the Robinhood MCP session (streamable HTTP over an OAuth-
-    authenticated client), hand it to Gemini Flash as a tool binding, and
-    let the model drive the order through `place_equity_order`.
-    Returns the model's final text report.
-    """
-    from google.genai import types
-    from mcp import ClientSession
-    from mcp.client.streamable_http import streamable_http_client
-    from robinhood_auth import (MCP_SERVER_URL,
-                                make_authenticated_http_client)
-
-    http = await make_authenticated_http_client()
-    try:
-        async with streamable_http_client(
-            config.ROBINHOOD_MCP_URL or MCP_SERVER_URL, http_client=http
-        ) as streams:
-            read_stream, write_stream = streams[0], streams[1]
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()  # MCP handshake (auth auto-refreshes)
-
-                client = _build_gemini_client()
-                response = await client.aio.models.generate_content(
-                    model=config.GEMINI_MODEL,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=EXECUTOR_SYSTEM_INSTRUCTION,
-                        tools=[types.Tool(mcp_client=session)],  # MCP → Gemini
-                    ),
-                )
-                return response.text or "(empty model response)"
-    finally:
-        await http.aclose()
-
-
-def execute_via_gemini_mcp(signal: Dict[str, Any]) -> Tuple[bool, str]:
-    """Sync wrapper around the async MCP session. Never raises."""
-    prompt = (
-        "Trade card (do not modify any value):\n"
-        f"ticker: {signal['ticker']}\n"
-        f"side: {str(signal['action']).lower()}\n"
-        f"quantity: {signal['quantity']} (fractional shares)\n"
-        f"total dollar value: {signal['dollar_val']}\n\n"
-        "Steps: 1) Fetch the account cash balance via the Robinhood MCP tool. "
-        "2) Verify the total dollar value is <= 10% of that cash balance. "
-        "3) If valid, place the order via place_equity_order exactly as "
-        "specified. 4) Report the order status."
-    )
-    try:
-        report = asyncio.run(_run_mcp_trade(prompt))
-        return True, report
-    except Exception as exc:  # noqa: BLE001 — report failure, don't crash Flask
-        logger.exception("MCP execution failed")
-        return False, f"MCP execution error: {exc}"
-
 
 # ---------------------------------------------------------------------------
 # HTTP endpoints
@@ -119,6 +39,22 @@ def execute_via_gemini_mcp(signal: Dict[str, Any]) -> Tuple[bool, str]:
 def health() -> Tuple[str, int]:
     """UptimeRobot pings this every few minutes to keep Render awake."""
     return "OK", 200
+
+
+@app.route("/preflight", methods=["GET"])
+def preflight() -> Tuple[Any, int]:
+    """Read-only end-to-end MCP check (handshake + get_accounts).
+    Gated by the same passphrase header as /execute when one is set."""
+    if config.WEBHOOK_PASSPHRASE and \
+            request.headers.get("X-Webhook-Passphrase", "") != \
+            config.WEBHOOK_PASSPHRASE:
+        return jsonify({"error": "unauthorized"}), 401
+    result = mcp_preflight()
+    return jsonify({
+        "dry_run": config.EXECUTOR_DRY_RUN,
+        "mcp_ok": result.get("ok", False),
+        "detail": result.get("error") or result.get("accounts_text", ""),
+    }), (200 if result.get("ok") else 502)
 
 
 @app.route("/execute", methods=["POST"])
@@ -156,37 +92,22 @@ def execute() -> Tuple[Any, int]:
         logger.info("Duplicate signal %s ignored.", key)
         return jsonify({"status": "duplicate_ignored"}), 200
 
-    # 3. Deterministic pre-check of the 10% rule — code re-verifies before
-    #    the LLM even sees the card (LLM never touches numbers).
-    balance = _fetch_cash_balance_for_validation()
-    if balance is not None:
-        max_allowed = balance * config.CAPITAL_ALLOCATION_PCT
-        if dollar_val > max_allowed * 1.01:  # 1% headroom for fee/rounding drift
-            logger.error("Refusing %s: $%.2f > 10%% of $%.2f",
-                         ticker, dollar_val, balance)
-            send_discord_alert(action, ticker, quantity, dollar_val,
-                               reason=("BLOCKED: exceeds 10% allocation cap "
-                                       f"(${max_allowed:,.2f} max)"),
-                               success=False)
-            return jsonify({"error": "exceeds 10% allocation cap",
-                            "max_allowed": round(max_allowed, 2)}), 400
-    else:
-        logger.warning("Cash balance unavailable for pre-check — deferring to "
-                       "the MCP-side 10% rule in the system instruction.")
-
-    # 4. Execute via Gemini 2.5 Flash + Robinhood MCP.
-    _SEEN_SIGNALS[key] = True
+    # 3. Dry-run kill-switch: validate everything, simulate the fill.
     if config.EXECUTOR_DRY_RUN:
         logger.warning("EXECUTOR_DRY_RUN=1 — simulating fill (no MCP call, "
                        "no order placed).")
-        report = (
-            "[DRY RUN] Simulated fill: {action} {qty} {ticker} for "
-            "${dv:,.2f}. Gemini+MCP skipped by kill-switch.".format(
-                action=action, qty=quantity, ticker=ticker,
-                dv=dollar_val))
-        ok = True
-    else:
-        ok, report = execute_via_gemini_mcp(signal)
+        _SEEN_SIGNALS[key] = True
+        report = ("[DRY RUN] Simulated fill: {action} {qty} {ticker} for "
+                  "${dv:,.2f}. Gemini+MCP skipped by kill-switch.".format(
+                      action=action, qty=quantity, ticker=ticker,
+                      dv=dollar_val))
+        send_discord_alert(action, ticker, quantity, dollar_val,
+                           reason=report, success=True)
+        return jsonify({"status": "executed", "report": report}), 200
+
+    # 4. Execute: deterministic pre-checks + Gemini/MCP order placement.
+    _SEEN_SIGNALS[key] = True
+    ok, report = execute_signal(signal)
     logger.info("Execution result ok=%s report=%s", ok, report[:200])
 
     # 5. Discord alert (notification, not control plane).
@@ -197,70 +118,6 @@ def execute() -> Tuple[Any, int]:
     )
     return jsonify({"status": "executed" if ok else "failed",
                     "report": report}), 200 if ok else 502
-
-
-def _fetch_cash_balance_for_validation() -> Optional[float]:
-    """Best-effort cash read via Alpaca (paper unless ALPACA_PAPER=live)."""
-    try:
-        from alpaca.trading.client import TradingClient
-        base_url = ("https://paper-api.alpaca.markets" if config.ALPACA_PAPER
-                    else None)
-        client = TradingClient(
-            config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY,
-            paper=config.ALPACA_PAPER, url_override=base_url,
-        )
-        return float(client.get_account().cash)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Balance pre-check unavailable: %s", exc)
-        return config.FALLBACK_ACCOUNT_BALANCE
-
-
-def _mcp_preflight() -> Dict[str, Any]:
-    """Read-only MCP handshake + cash read. Proves OAuth tokens, session
-    init, and get_accounts all work. Never places an order."""
-    import asyncio
-
-    async def _run() -> Dict[str, Any]:
-        from mcp import ClientSession
-        from mcp.client.streamable_http import streamable_http_client
-        from robinhood_auth import (MCP_SERVER_URL,
-                                    make_authenticated_http_client)
-
-        http = await make_authenticated_http_client()
-        try:
-            async with streamable_http_client(
-                config.ROBINHOOD_MCP_URL or MCP_SERVER_URL, http_client=http
-            ) as streams:
-                async with ClientSession(streams[0], streams[1]) as session:
-                    await session.initialize()
-                    accounts = await session.call_tool("get_accounts", {})
-                    text = "\n".join(
-                        c.text for c in (accounts.content or [])
-                        if getattr(c, "text", None))
-                    return {"ok": True, "accounts_text": text[:500]}
-        finally:
-            await http.aclose()
-
-    try:
-        return asyncio.run(_run())
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc)}
-
-
-@app.route("/preflight", methods=["GET"])
-def preflight() -> Tuple[Any, int]:
-    """Read-only end-to-end MCP check (handshake + get_accounts).
-    Gated by the same passphrase header as /execute when one is set."""
-    if config.WEBHOOK_PASSPHRASE and \
-            request.headers.get("X-Webhook-Passphrase", "") != \
-            config.WEBHOOK_PASSPHRASE:
-        return jsonify({"error": "unauthorized"}), 401
-    result = _mcp_preflight()
-    return jsonify({
-        "dry_run": config.EXECUTOR_DRY_RUN,
-        "mcp_ok": result.get("ok", False),
-        "detail": result.get("error") or result.get("accounts_text", ""),
-    }), (200 if result.get("ok") else 502)
 
 
 if __name__ == "__main__":

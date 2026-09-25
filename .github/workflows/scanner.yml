@@ -4,8 +4,17 @@ name: TJR SMC Scanner
 # Monday–Friday. Timezone is declared explicitly; the cron runs in that
 # zone (fall back to '*/5 13-14 * * 1-5' UTC if your Actions runner
 # predates timezone support).
+#
+# Pipeline (all $0, no Render): scanner computes the signal in-process,
+# executor.py re-verifies the 10% cap against the live Robinhood account,
+# then Gemini + Robinhood MCP place the order. Discord alerts every outcome.
 on:
-  workflow_dispatch:      # manual test trigger
+  workflow_dispatch:
+    inputs:
+      selftest:
+        description: "Synthetic end-to-end selftest (no session gate)"
+        type: boolean
+        default: false
   schedule:
     - cron: '*/5 9-10 * * 1-5'
       timezone: "America/New_York"
@@ -40,24 +49,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Warm up Render service (cold-start guard)
-        env:
-          RENDER_WEBHOOK_URL: ${{ secrets.RENDER_WEBHOOK_URL }}
-        run: |
-          if [ -n "$RENDER_WEBHOOK_URL" ]; then
-            # Free-tier instances sleep after ~15 min idle; first hit wakes
-            # them (~50s). This ping absorbs that latency before real
-            # signals arrive, making UptimeRobot effectively optional.
-            curl -s --max-time 90 "$RENDER_WEBHOOK_URL/health" || true
-          else
-            echo "RENDER_WEBHOOK_URL secret not set — skipping warmup"
-          fi
-
-      - name: Run scanner
+      - name: Run scanner (or selftest drill)
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          RENDER_WEBHOOK_URL: ${{ secrets.RENDER_WEBHOOK_URL }}
-          WEBHOOK_PASSPHRASE: ${{ secrets.WEBHOOK_PASSPHRASE }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
+          ROBINHOOD_TOKEN_STORE_JSON: ${{ secrets.ROBINHOOD_TOKEN_STORE_JSON }}
           ALPACA_PAPER: "paper"
-        run: python scanner.py
+          EXECUTOR_DRY_RUN: "1"
+          SCANNER_SELFTEST: ${{ inputs.selftest }}
+        run: |
+          if [ "$SCANNER_SELFTEST" = "true" ] || [ "$SCANNER_SELFTEST" = "1" ]; then
+            python scanner.py --selftest
+          else
+            python scanner.py
+          fi

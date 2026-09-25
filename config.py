@@ -61,7 +61,8 @@ if _raw_headers:
 # NOTE: both AIza (AI Studio) and AQ. (Vertex express) keys work via the
 # Developer API endpoint (generativelanguage.googleapis.com) — verified
 # empirically 2026-09-25. gemini-2.5-flash is retired for new users.
-GEMINI_MODEL: str = _get_env("GEMINI_MODEL", "gemini-3.5-flash")
+# ("or" fallback so an empty-but-present env var can't blank the model.)
+GEMINI_MODEL: str = _get_env("GEMINI_MODEL") or "gemini-3.5-flash"
 
 # ---------------------------------------------------------------------------
 # Risk & sizing constants (hard-coded guardrails — code cannot talk its way

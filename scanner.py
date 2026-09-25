@@ -2,18 +2,26 @@
 scanner.py — Event scanner executed by GitHub Actions every 5 minutes.
 
 Flow: watchlist → 5m bars (closed only) → TJR setup check → 10% position
-sizing → POST to the Render executor. The scanner NEVER talks to a broker;
-it only computes and signals. Fully idempotent per run (stateless).
+sizing → in-process execution via executor.py (deterministic pre-checks →
+Gemini+Robinhood MCP placement → Discord alert). The scanner NEVER talks to
+the broker directly and the LLM never touches numbers. Fully stateless per
+run; idempotency comes from the executor's pre-checks.
+
+Drill mode: `python scanner.py --selftest` runs a synthetic end-to-end check
+(no session gate) — deterministic guardrail unit checks plus one plumbing
+card. Under EXECUTOR_DRY_RUN=1 the plumbing card is simulated; set it to 0
+deliberately for a real end-to-end placement.
 """
 
 import logging
 import os
+import sys
 from typing import Dict, List, Optional
 
 import pandas as pd
-import requests
 
 import config
+from discord_notify import send_discord_alert
 from screener import get_daily_dynamic_watchlist
 from strategy import evaluate_tjr_setup
 
@@ -79,28 +87,87 @@ def get_cash_balance() -> Optional[float]:
         return None
 
 
-def send_to_executor(signal: Dict[str, object]) -> bool:
-    """POST the trade card to the Render executor. One retry on failure."""
-    url = f"{config.RENDER_WEBHOOK_URL}/execute"
-    headers = {
-        "X-Webhook-Passphrase": config.WEBHOOK_PASSPHRASE,
-        "Content-Type": "application/json",
+def execute_in_process(signal: Dict[str, object]) -> bool:
+    """
+    Execute the trade card in-process (GitHub Actions pipeline):
+    deterministic pre-checks → Gemini+MCP placement → Discord alert.
+    Under EXECUTOR_DRY_RUN the fill is simulated (alert path still fires).
+    """
+    import executor as executor_core
+
+    if config.EXECUTOR_DRY_RUN:
+        logger.warning("EXECUTOR_DRY_RUN=1 — simulating fill (no MCP call, "
+                       "no order placed).")
+        report = ("[DRY RUN] Simulated fill: {action} {qty} {ticker} for "
+                  "${dv:,.2f}.".format(action=signal["action"],
+                                       qty=signal["quantity"],
+                                       ticker=signal["ticker"],
+                                       dv=signal["dollar_val"]))
+        send_discord_alert(str(signal["action"]), str(signal["ticker"]),
+                           float(signal["quantity"]),
+                           float(signal["dollar_val"]),
+                           reason=report, success=True)
+        return True
+
+    ok, report = executor_core.execute_signal(signal)
+    logger.info("Execution result ok=%s report=%s", ok, report[:200])
+    send_discord_alert(
+        action=str(signal["action"]), ticker=str(signal["ticker"]),
+        quantity=float(signal["quantity"]),
+        dollar_val=float(signal["dollar_val"]),
+        reason=(report if ok else f"EXECUTION FAILED: {report}")[:1000],
+        success=ok,
+    )
+    return ok
+
+
+def _selftest() -> int:
+    """
+    Synthetic end-to-end drill, independent of the 09:30–11:00 session gate.
+    1. Deterministic guardrail unit checks (no network).
+    2. One plumbing card through execute_in_process → Discord alert +
+       dry-run simulation (or the real path when EXECUTOR_DRY_RUN=0).
+    Exit 0 = all green.
+    """
+    import executor as executor_core
+
+    failures = 0
+
+    def _check(name: str, ok: bool) -> None:
+        nonlocal failures
+        print(("PASS" if ok else "FAIL") + "  " + name)
+        if not ok:
+            failures += 1
+
+    print("=== scanner selftest ===")
+
+    # 1. deterministic guardrails (pure functions, no network)
+    _check("cap allows $10 at 10% of $100 cash",
+           executor_core.check_cap(10.0, 100.0)[0])
+    _check("cap blocks $10.20 (beyond 1% headroom of $10.10)",
+           not executor_core.check_cap(10.20, 100.0)[0])
+    _check("cap blocks $102 at 10% of $100 cash",
+           not executor_core.check_cap(102.0, 100.0)[0])
+    _check("cap refuses when cash is unknown",
+           not executor_core.check_cap(5.0, None)[0])
+    _check("min notional blocks $0.50",
+           not executor_core.check_min_notional(0.5)[0])
+    _check("one-position rule allows 0 open",
+           executor_core.check_no_open_positions(0)[0])
+    _check("one-position rule blocks 2 open",
+           not executor_core.check_no_open_positions(2)[0])
+    _check("one-position rule refuses when unknown",
+           not executor_core.check_no_open_positions(None)[0])
+
+    # 2. plumbing card (alert + dry-run sim, or real path if kill-switch off)
+    card: Dict[str, object] = {
+        "ticker": "SPY", "action": "BUY", "quantity": 1.0,
+        "dollar_val": 100.0, "reason": "selftest plumbing drill",
     }
-    for attempt in (1, 2):
-        try:
-            resp = requests.post(
-                url, json=signal, headers=headers,
-                timeout=config.HTTP_TIMEOUT_SECONDS,
-            )
-            if resp.status_code == 200:
-                logger.info("Executor accepted %s %s",
-                            signal["action"], signal["ticker"])
-                return True
-            logger.error("Executor rejected (HTTP %s): %s",
-                         resp.status_code, resp.text[:300])
-        except requests.RequestException as exc:
-            logger.error("POST to executor failed (attempt %d): %s", attempt, exc)
-    return False
+    _check("plumbing card executed (alert fired)", execute_in_process(card))
+
+    print(f"=== selftest {'ALL GREEN' if failures == 0 else 'FAILED'} ===")
+    return 1 if failures else 0
 
 
 def main() -> None:
@@ -109,17 +176,31 @@ def main() -> None:
     if not SCANNER_AVAILABLE:
         logger.error("alpaca-py missing — aborting run.")
         return
-    if not config.RENDER_WEBHOOK_URL or not config.WEBHOOK_PASSPHRASE:
-        logger.error("RENDER_WEBHOOK_URL / WEBHOOK_PASSPHRASE not set — aborting.")
+    if not config.GEMINI_API_KEY:
+        logger.error("GEMINI_API_KEY not set — cannot execute signals.")
         return
 
     watchlist: List[str] = get_daily_dynamic_watchlist()
     logger.info("Watchlist: %s", watchlist)
 
+    # One read-only account fetch per run: sizing and the max-position guard
+    # use the SAME account the executor's cap check will verify (Robinhood).
+    import executor as executor_core
+    account_state = executor_core.fetch_account_state()
+    rh_cash = account_state.get("cash")
+    rh_open = account_state.get("open_positions")
+    if rh_open is not None and rh_open >= config.MAX_ACTIVE_POSITIONS:
+        logger.info("%d open position(s) — max reached, skipping scan.",
+                    rh_open)
+        return
+    if rh_cash is None:
+        logger.warning("Robinhood cash unavailable — falling back to Alpaca "
+                       "for sizing only (executor cap check still applies).")
+
     data_client = StockHistoricalDataClient(
         config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY
     )
-    open_positions = 0  # scanner-side counter (executor re-validates anyway)
+    open_positions = rh_open or 0  # executor re-validates anyway
 
     for symbol in watchlist:
         if open_positions >= config.MAX_ACTIVE_POSITIONS:
@@ -139,7 +220,7 @@ def main() -> None:
             # --- Position sizing: strict 10% of cash ----------------------
             # trade_budget = balance * CAPITAL_ALLOCATION_PCT (0.10)
             # quantity     = trade_budget / last_close, 4dp fractional shares
-            balance = get_cash_balance()
+            balance = rh_cash if rh_cash is not None else get_cash_balance()
             if balance is None:
                 logger.error("No balance available — skipping %s signal.", symbol)
                 continue
@@ -165,7 +246,7 @@ def main() -> None:
             }
             logger.info("SIGNAL %s: %s", symbol, signal)
 
-            if send_to_executor(signal):
+            if execute_in_process(signal):
                 open_positions += 1
 
         except Exception as exc:  # noqa: BLE001 — one symbol must not kill the scan
@@ -175,4 +256,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if "--selftest" in sys.argv or os.environ.get("SCANNER_SELFTEST", "") == "1":
+        raise SystemExit(_selftest())
     main()
