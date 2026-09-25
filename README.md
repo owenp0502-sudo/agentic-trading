@@ -264,6 +264,36 @@ targets, and nothing beats break-even. Conclusions:
 4. Until a strategy shows PF > ~1.3 over 30+ verified trades, keep
    `EXECUTOR_DRY_RUN=1`.
 
+### Sep 25, 2026 (latest) — volume confirmation: filters winners too, rejected
+
+Hypothesis: institutional displacement should print volume, so requiring
+trigger-bar volume ≥ k × prior-20-bar mean should filter losers. Shipped
+as `VOLUME_CONFIRM` (default **off**; `VOL_MULT`, `VOL_LOOKBACK` knobs;
+fails closed on missing volume — including a NaN-comparison trap the
+fail-closed test caught before it shipped).
+
+| Universe | Filter | Trades | Win% | Avg R | P&L |
+|---|---|---|---|---|---|
+| Mega-cap 12 | off | 11 | 36% | −0.03R | +$1 |
+| Mega-cap 12 | 1.5× | 2 | 0% | −0.57R | −$31 |
+| Mega-cap 12 | 2.5× | 1 | 0% | −1.02R | −$27 |
+| High-beta 6 | off | 22 | 27% | −0.20R | −$121 |
+| High-beta 6 | 1.5× | 8 | 38% | −0.27R | −$65 |
+| High-beta 6 | 2.5× | 3 | 0% | −0.35R | −$42 |
+
+**Result: rejected.** On mega-caps the filter removed every winner and
+kept losers (11 → 2 trades, both losses). On high-beta it only trades
+less (−$121 → −$65 is bleed reduction via inactivity, not edge; avg-R
+worsens). The high-volume trigger bars are where the checklist's few
+winners live — volume is *already priced into* the displacement the MSS
+check requires. Keep `VOLUME_CONFIRM=0` (default).
+
+**Standing conclusion after ~55 verified trades across every lever:**
+no tested filter or relaxation produces positive expectancy on this
+universe/timeframe. The signal itself (sweep→MSS→FVG at 5m on liquid
+US equities, Jul–Sep 2026) does not carry edge as encoded. Further work
+needs different signal logic or different markets — not more filters.
+
 ## Known deviations from the original spec
 
 - `yfinance` / `smartmoneyconcepts` are listed per spec but currently unused

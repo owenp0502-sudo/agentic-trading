@@ -232,6 +232,52 @@ def test_delayed_chain_rejected_by_strict_arm() -> None:
         config.SWEEP_ARM_BARS = old
 
 
+def test_volume_confirmation_filters_quiet_triggers() -> None:
+    """Same textbook setup, trigger volume varied: high vol fires (with the
+    filter on), mean vol is rejected, and defaults leave it off."""
+    old = (config.VOLUME_CONFIRM, config.VOL_MULT)
+    try:
+        df = _bullish_setup()
+        df.iloc[-1, df.columns.get_loc("volume")] = 3_000_000  # 3× baseline
+        config.VOLUME_CONFIRM, config.VOL_MULT = True, 1.5
+        res = strategy.evaluate_tjr_setup(df)
+        assert res["setup_valid"] is True, res
+        assert res["checks"]["vol_ratio"] >= 1.5
+
+        df2 = _bullish_setup()
+        df2.iloc[-1, df2.columns.get_loc("volume")] = 1_000_000  # 1× baseline
+        res2 = strategy.evaluate_tjr_setup(df2)
+        assert res2["setup_valid"] is False
+        assert res2["checks"]["volume_confirm"] is False
+    finally:
+        config.VOLUME_CONFIRM, config.VOL_MULT = old
+
+
+def test_volume_confirmation_off_by_default() -> None:
+    old = config.VOLUME_CONFIRM
+    try:
+        config.VOLUME_CONFIRM = False
+        df = _bullish_setup()
+        df.iloc[-1, df.columns.get_loc("volume")] = 1  # absurdly low
+        res = strategy.evaluate_tjr_setup(df)
+        assert res["setup_valid"] is True  # filter off → no effect
+    finally:
+        config.VOLUME_CONFIRM = old
+
+
+def test_volume_confirmation_fails_closed_on_bad_data() -> None:
+    old = config.VOLUME_CONFIRM
+    try:
+        config.VOLUME_CONFIRM, config.VOL_MULT = True, 1.5
+        df = _bullish_setup()
+        df.iloc[-1, df.columns.get_loc("volume")] = None  # corrupt trigger
+        res = strategy.evaluate_tjr_setup(df)
+        assert res["setup_valid"] is False
+        assert res["checks"]["volume_confirm"] is False
+    finally:
+        config.VOLUME_CONFIRM = old
+
+
 def test_sweep_without_mss_fails() -> None:
     when = datetime(2026, 9, 24, 10, 30, tzinfo=NY)
     n = strategy_min_bars() + 5

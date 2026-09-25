@@ -279,10 +279,11 @@ def run(days: int, symbols: List[str], equity: float, allow_shorts: bool,
         session_end: Optional[str] = None, no_fvg: bool = False,
         max_stop_pct: Optional[float] = None,
         arm_bars: Optional[int] = None, freq: str = "5min",
-        refresh: bool = False) -> None:
+        refresh: bool = False, vol_mult: Optional[float] = None) -> None:
     # Optional experiment overrides (restored after the run)
     saved = (config.SESSION_START, config.SESSION_END, config.FVG_REQUIRED,
-             config.MAX_STOP_DISTANCE_PCT, config.SWEEP_ARM_BARS)
+             config.MAX_STOP_DISTANCE_PCT, config.SWEEP_ARM_BARS,
+             config.VOLUME_CONFIRM, config.VOL_MULT)
     if session_start:
         config.SESSION_START = session_start
     if session_end:
@@ -293,12 +294,16 @@ def run(days: int, symbols: List[str], equity: float, allow_shorts: bool,
         config.MAX_STOP_DISTANCE_PCT = max_stop_pct
     if arm_bars is not None:
         config.SWEEP_ARM_BARS = arm_bars
+    if vol_mult is not None:  # enabling a multiplier turns the filter on
+        config.VOLUME_CONFIRM = True
+        config.VOL_MULT = vol_mult
     try:
         _run_inner(days, symbols, equity, allow_shorts, slip_bps, freq,
                    refresh)
     finally:
         (config.SESSION_START, config.SESSION_END, config.FVG_REQUIRED,
-         config.MAX_STOP_DISTANCE_PCT, config.SWEEP_ARM_BARS) = saved
+         config.MAX_STOP_DISTANCE_PCT, config.SWEEP_ARM_BARS,
+         config.VOLUME_CONFIRM, config.VOL_MULT) = saved
 
 
 def _run_inner(days: int, symbols: List[str], equity: float,
@@ -453,10 +458,13 @@ if __name__ == "__main__":
                     help="bar timeframe (protocol applies to either)")
     ap.add_argument("--refresh", action="store_true",
                     help="rebuild the dataset cache instead of loading it")
+    ap.add_argument("--vol-mult", type=float, default=None,
+                    help="volume confirmation: trigger bar must be N× the "
+                         "prior-20-bar mean volume (e.g. 1.5)")
     args = ap.parse_args()
     if args.flatten_time:
         config.FLATTEN_TIME = args.flatten_time
     run(args.days, [s.upper() for s in args.symbols], args.equity,
         args.allow_shorts, args.slippage_bps, args.session_start,
         args.session_end, args.no_fvg, args.max_stop_pct, args.arm_bars,
-        args.freq, args.refresh)
+        args.freq, args.refresh, args.vol_mult)

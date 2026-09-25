@@ -112,6 +112,14 @@ TAKE_PROFIT_R: float = _get_env_float("TAKE_PROFIT_R", 2.0)     # 2R target
 FVG_REQUIRED: bool = _get_env(
     "FVG_REQUIRED", "1").lower() not in ("0", "false", "no")
 
+# Displacement volume confirmation: trigger-bar volume ≥ VOL_MULT × mean
+# volume of the prior VOL_LOOKBACK bars. OFF by default — new filter, live
+# behavior unchanged until deliberately enabled (backtest: --vol-mult 1.5).
+VOLUME_CONFIRM: bool = _get_env(
+    "VOLUME_CONFIRM", "0").lower() in ("1", "true", "yes")
+VOL_MULT: float = _get_env_float("VOL_MULT", 1.5)
+VOL_LOOKBACK: int = _get_env_int("VOL_LOOKBACK", 20)
+
 # Anchor the stop to the sweep level (TJR structure) when the scanner
 # provides one: just beyond the swept extreme, with the distance clamped
 # to [MIN, MAX] % of cost so noise can't stop us out and tails are bounded.

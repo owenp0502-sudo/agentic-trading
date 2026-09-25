@@ -18,6 +18,7 @@ Same data in → same verdict out. No network, no broker calls, no state.
 """
 
 import logging
+import math
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -238,6 +239,30 @@ def evaluate_tjr_setup(df: pd.DataFrame) -> Dict[str, object]:
     if not mss_ok:
         return invalid
     direction = sweep_dir
+
+    # --- Check 3b: displacement volume confirmation (optional) ------------
+    # Institutional displacement should print volume. Fail-closed: missing
+    # volume data rejects the setup. Off by default (VOLUME_CONFIRM env).
+    if config.VOLUME_CONFIRM:
+        vol_window = df.iloc[-(config.VOL_LOOKBACK + 1):-1]["volume"]
+        try:
+            vol_mean = float(vol_window.astype(float).mean())
+            trigger_vol = float(df.iloc[-1]["volume"])
+        except (TypeError, ValueError, KeyError):
+            checks["volume_confirm"] = False
+            checks["error"] = "volume data unavailable for confirmation"
+            return invalid
+        # NaN trap: pandas turns missing volumes into NaN and every NaN
+        # comparison is False — check finiteness explicitly (fail closed).
+        if (not math.isfinite(vol_mean) or not math.isfinite(trigger_vol)
+                or vol_mean <= 0
+                or trigger_vol < config.VOL_MULT * vol_mean):
+            checks["volume_confirm"] = False
+            checks["vol_ratio"] = (round(trigger_vol / vol_mean, 2)
+                                    if vol_mean > 0 else 0.0)
+            return invalid
+        checks["vol_ratio"] = round(trigger_vol / vol_mean, 2)
+    checks["volume_confirm"] = config.VOLUME_CONFIRM
 
     # --- Check 4: FVG in the displacement leg -----------------------------
     # FVG_REQUIRED=0 trades the sweep→MSS sequence alone (frequency over
