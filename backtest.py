@@ -281,6 +281,86 @@ def _simulate_long(bars: pd.DataFrame, sig_idx: int, sweep_level: Optional[float
     }
 
 
+def _simulate_long_pullback(
+        bars: pd.DataFrame, sig_idx: int, sweep_level: Optional[float],
+        fvg_price: Optional[float], equity: float, slip: float,
+        entry_window: int) -> Optional[Dict[str, Any]]:
+    """TJR-faithful entry: after the setup bar, place a passive limit at the
+    FVG midpoint and fill only if price retraces into the gap within
+    `entry_window` bars. From the fill onward, identical bracket logic to
+    _simulate_long (stop-first ordering, ratchet on close, time stop,
+    flatten). Unfilled orders cancel — no chase.
+
+    Selection effect is deliberate and faithfully modeled: signals whose
+    price never retraces to the gap are MISSED (the cost of patience), in
+    exchange for a materially better entry price on the fills.
+    """
+    if fvg_price is None or fvg_price <= 0:
+        return None
+    n = len(bars)
+    fill_j = None
+    last_j = min(n - 1, sig_idx + entry_window)
+    for j in range(sig_idx + 1, last_j + 1):
+        if float(bars.iloc[j]["low"]) <= fvg_price:
+            fill_j = j
+            break
+    if fill_j is None:
+        return None  # never retraced — order cancelled, no trade
+    # a fill at/after flatten time is a cancelled order, not a trade
+    if bars.iloc[fill_j].name.to_pydatetime().astimezone(NY_TZ) \
+            .strftime("%H:%M") >= config.FLATTEN_TIME:
+        return None
+
+    entry = fvg_price * (1 + slip)
+    stop = exits.compute_stop("BUY", entry, sweep_level)
+    risk = entry - stop
+    if risk <= 0:
+        return None
+    target = exits.compute_target("BUY", entry, stop)
+    qty = (equity * config.CAPITAL_ALLOCATION_PCT) / entry
+
+    exit_price: Optional[float] = None
+    reason, exit_ts = None, None
+    bars_held = 0
+    # Conservative: exit checks start the bar AFTER the fill (the fill bar's
+    # intra-bar ordering is unknowable from OHLC — never credit it).
+    for j in range(fill_j + 1, n):
+        bar = bars.iloc[j]
+        ts = bar.name.to_pydatetime()
+        if ts.astimezone(NY_TZ).strftime("%H:%M") >= config.FLATTEN_TIME:
+            exit_price, reason, exit_ts = float(bar["open"]) * (1 - slip), \
+                "FLATTEN", ts
+            break
+        low, high, close = (float(bar["low"]), float(bar["high"]),
+                            float(bar["close"]))
+        if low <= stop:  # worst case: fill bar that also spans the stop
+            exit_price, reason, exit_ts = stop * (1 - slip), "STOP", ts
+            break
+        if high >= target:
+            exit_price, reason, exit_ts = target * (1 - slip), "TARGET", ts
+            break
+        bars_held += 1
+        if config.TIME_STOP_BARS and bars_held >= config.TIME_STOP_BARS:
+            exit_price, reason, exit_ts = close * (1 - slip), \
+                f"TIME-{config.TIME_STOP_BARS}", ts
+            break
+        new_stop = exits.trailed_stop("BUY", entry, stop, close)
+        if new_stop is not None:
+            stop = new_stop
+
+    if exit_price is None:
+        last = bars.iloc[-1]
+        exit_price = float(last["close"]) * (1 - slip)
+        reason, exit_ts = "EOD-DATA", last.name.to_pydatetime()
+
+    return {
+        "entry": entry, "exit": exit_price, "initial_stop": stop,
+        "target": target, "risk": risk, "reason": reason, "qty": qty,
+        "entry_ts": bars.iloc[fill_j].name.to_pydatetime(),
+        "exit_ts": exit_ts,
+    }
+
+
 def run(days: int, symbols: List[str], equity: float, allow_shorts: bool,
         slip_bps: float, session_start: Optional[str] = None,
         session_end: Optional[str] = None, no_fvg: bool = False,
@@ -288,7 +368,8 @@ def run(days: int, symbols: List[str], equity: float, allow_shorts: bool,
         arm_bars: Optional[int] = None, freq: str = "5min",
         refresh: bool = False, vol_mult: Optional[float] = None,
         tp_r: Optional[float] = None,
-        time_stop_bars: Optional[int] = None) -> None:
+        time_stop_bars: Optional[int] = None,
+        entry: str = "market", entry_window: int = 12) -> None:
     # Optional experiment overrides (restored after the run)
     saved = (config.SESSION_START, config.SESSION_END, config.FVG_REQUIRED,
              config.MAX_STOP_DISTANCE_PCT, config.SWEEP_ARM_BARS,
@@ -313,7 +394,7 @@ def run(days: int, symbols: List[str], equity: float, allow_shorts: bool,
         config.TIME_STOP_BARS = time_stop_bars
     try:
         _run_inner(days, symbols, equity, allow_shorts, slip_bps, freq,
-                   refresh)
+                   refresh, entry, entry_window)
     finally:
         (config.SESSION_START, config.SESSION_END, config.FVG_REQUIRED,
          config.MAX_STOP_DISTANCE_PCT, config.SWEEP_ARM_BARS,
@@ -323,7 +404,8 @@ def run(days: int, symbols: List[str], equity: float, allow_shorts: bool,
 
 def _run_inner(days: int, symbols: List[str], equity: float,
                allow_shorts: bool, slip_bps: float, freq: str,
-               refresh: bool) -> None:
+               refresh: bool, entry: str = "market",
+               entry_window: int = 12) -> None:
     client = _alpaca_client()
     slip = slip_bps / 10_000.0
     today = datetime.now(tz=NY_TZ).replace(hour=12, minute=0,
@@ -363,14 +445,16 @@ def _run_inner(days: int, symbols: List[str], equity: float,
             if setup["direction"] == "SELL" and not allow_shorts:
                 continue
             signals.append({
-                "symbol": symbol, "date": date,
-                "sig_idx": i, "df": df,
-                "sweep": setup["checks"].get("sweep_level"),
-                "direction": setup["direction"],
-                "entry_ts": entry_ts,
-            })
+                    "symbol": symbol, "date": date,
+                    "sig_idx": i, "df": df,
+                    "sweep": setup["checks"].get("sweep_level"),
+                    "fvg": setup["checks"].get("fvg_price"),
+                    "direction": setup["direction"],
+                    "entry_ts": entry_ts,
+                })
 
-    # Pass 2: simulate chronologically; one position at a time
+    # Pass 2: simulate chronologically; one position OR pending order at a
+    # time (a single pipeline cannot chase while an order rests).
     signals.sort(key=lambda s: s["entry_ts"])
     busy_until: Optional[datetime] = None
     trades: List[Dict[str, Any]] = []
@@ -379,9 +463,18 @@ def _run_inner(days: int, symbols: List[str], equity: float,
             continue  # MAX_ACTIVE_POSITIONS=1 — executor would skip this
         if sig["direction"] == "SELL":
             continue  # long-exit engine only; shorts recorded as skipped
-        result = _simulate_long(sig["df"], sig["sig_idx"], sig["sweep"],
-                                equity, slip)
+        if entry == "fvg":
+            result = _simulate_long_pullback(
+                sig["df"], sig["sig_idx"], sig["sweep"], sig.get("fvg"),
+                equity, slip, entry_window)
+        else:
+            result = _simulate_long(sig["df"], sig["sig_idx"], sig["sweep"],
+                                    equity, slip)
         if result is None:
+            if entry == "fvg":
+                # unfilled limit: pipeline busy until the order window ends
+                busy_until = sig["entry_ts"] + timedelta(
+                    minutes=5 * entry_window)
             continue
         result.update({"date": sig["date"], "symbol": sig["symbol"],
                        "direction": sig["direction"]})
@@ -481,10 +574,18 @@ if __name__ == "__main__":
     ap.add_argument("--time-stop", type=int, default=None,
                     help="exit flat positions after N bars (0 = hold to "
                          "flatten, the default)")
+    ap.add_argument("--entry", type=str, default="market",
+                    choices=["market", "fvg"],
+                    help="market = chase next open; fvg = passive limit at "
+                         "the FVG midpoint, cancelled if untraced within "
+                         "--entry-window bars (TJR pullback entry)")
+    ap.add_argument("--entry-window", type=int, default=12,
+                    help="bars a pullback limit order rests before cancel")
     args = ap.parse_args()
     if args.flatten_time:
         config.FLATTEN_TIME = args.flatten_time
     run(args.days, [s.upper() for s in args.symbols], args.equity,
         args.allow_shorts, args.slippage_bps, args.session_start,
         args.session_end, args.no_fvg, args.max_stop_pct, args.arm_bars,
-        args.freq, args.refresh, args.vol_mult, args.tp_r, args.time_stop)
+        args.freq, args.refresh, args.vol_mult, args.tp_r, args.time_stop,
+        args.entry, args.entry_window)

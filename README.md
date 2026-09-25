@@ -324,6 +324,32 @@ symmetry exists.
   over 30+ verified trades. The execution stack, guardrails, and this
   backtester are ready for that signal the day one is found.
 
+### Sep 25, 2026 (conclusion) — pullback entries: the patient fill is anti-selective
+
+The last untested mechanism: TJR's own entry doctrine. Instead of chasing
+at the next open (`--entry market`), rest a passive limit at the FVG
+midpoint and fill only on retrace (`--entry fvg --entry-window 12`),
+identical brackets after fill. Same 82-signal book, IS/OOS split:
+
+| Entry | IS | OOS |
+|---|---|---|
+| market, TP2R+BE | 25tr 20% −0.35R | 27tr 15% −0.68R |
+| **FVG pullback, TP2R+BE** | 25tr **12% −1.10R** | 20tr **10% −1.17R** |
+
+**Dramatically worse** (−1.17R = fill-then-immediate-stop). The fill-rate
+diagnostic explains it: only ~25 of 82 signals retrace to the gap within
+the window — and those are the *weak* setups. The never-retraced majority
+are the ones that run; chasing captures them, waiting selects against
+them. In this regime the pullback doctrine is anti-selective.
+
+**Complete negative result across the entire first hypothesis space:**
+entries (chase / pullback / inverted), exits (24 configs), filters
+(volume), timeframe (5m/15m), universe (mega/high-beta), arming (5–15
+bars). ~130 verified trades total. The signal carries no edge here; its
+inverse carries none either; no tested mechanism converts it into one.
+This is the definitive answer for Jul–Sep 2026 liquid-US-equity 5m data
+under production-faithful simulation with costs.
+
 ## Known deviations from the original spec
 
 - `yfinance` / `smartmoneyconcepts` are listed per spec but currently unused
