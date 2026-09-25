@@ -176,7 +176,17 @@ def execute() -> Tuple[Any, int]:
 
     # 4. Execute via Gemini 2.5 Flash + Robinhood MCP.
     _SEEN_SIGNALS[key] = True
-    ok, report = execute_via_gemini_mcp(signal)
+    if config.EXECUTOR_DRY_RUN:
+        logger.warning("EXECUTOR_DRY_RUN=1 — simulating fill (no MCP call, "
+                       "no order placed).")
+        report = (
+            "[DRY RUN] Simulated fill: {action} {qty} {ticker} for "
+            "${dv:,.2f}. Gemini+MCP skipped by kill-switch.".format(
+                action=action, qty=quantity, ticker=ticker,
+                dv=dollar_val))
+        ok = True
+    else:
+        ok, report = execute_via_gemini_mcp(signal)
     logger.info("Execution result ok=%s report=%s", ok, report[:200])
 
     # 5. Discord alert (notification, not control plane).
@@ -203,6 +213,54 @@ def _fetch_cash_balance_for_validation() -> Optional[float]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Balance pre-check unavailable: %s", exc)
         return config.FALLBACK_ACCOUNT_BALANCE
+
+
+def _mcp_preflight() -> Dict[str, Any]:
+    """Read-only MCP handshake + cash read. Proves OAuth tokens, session
+    init, and get_accounts all work. Never places an order."""
+    import asyncio
+
+    async def _run() -> Dict[str, Any]:
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamable_http_client
+        from robinhood_auth import (MCP_SERVER_URL,
+                                    make_authenticated_http_client)
+
+        http = await make_authenticated_http_client()
+        try:
+            async with streamable_http_client(
+                config.ROBINHOOD_MCP_URL or MCP_SERVER_URL, http_client=http
+            ) as streams:
+                async with ClientSession(streams[0], streams[1]) as session:
+                    await session.initialize()
+                    accounts = await session.call_tool("get_accounts", {})
+                    text = "\n".join(
+                        c.text for c in (accounts.content or [])
+                        if getattr(c, "text", None))
+                    return {"ok": True, "accounts_text": text[:500]}
+        finally:
+            await http.aclose()
+
+    try:
+        return asyncio.run(_run())
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+@app.route("/preflight", methods=["GET"])
+def preflight() -> Tuple[Any, int]:
+    """Read-only end-to-end MCP check (handshake + get_accounts).
+    Gated by the same passphrase header as /execute when one is set."""
+    if config.WEBHOOK_PASSPHRASE and \
+            request.headers.get("X-Webhook-Passphrase", "") != \
+            config.WEBHOOK_PASSPHRASE:
+        return jsonify({"error": "unauthorized"}), 401
+    result = _mcp_preflight()
+    return jsonify({
+        "dry_run": config.EXECUTOR_DRY_RUN,
+        "mcp_ok": result.get("ok", False),
+        "detail": result.get("error") or result.get("accounts_text", ""),
+    }), (200 if result.get("ok") else 502)
 
 
 if __name__ == "__main__":

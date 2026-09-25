@@ -5,3 +5,7 @@ __pycache__/
 venv/
 *.log
 .DS_Store
+
+# Local one-off tooling (OAuth bootstrap helpers, secret push script)
+.rh_*
+.set_gh_secrets.sh

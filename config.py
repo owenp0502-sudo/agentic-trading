@@ -108,3 +108,9 @@ FLASK_PORT: int = int(_get_env("PORT", "10000"))  # Render exposes PORT
 # Environment marker: "paper" (default) makes the TradingClient read-only-safe
 # against paper accounts; set to "live" deliberately in Render to read real cash.
 ALPACA_PAPER: bool = _get_env("ALPACA_PAPER", "paper").lower() != "live"
+
+# Execution kill-switch: when "1"/"true", /execute still validates the full
+# flow (passphrase gate, 10% cap pre-check, dedupe) but SKIPS Gemini + MCP and
+# returns a simulated fill. Default off — flip deliberately for first
+# deployments and drills.
+EXECUTOR_DRY_RUN: bool = _get_env("EXECUTOR_DRY_RUN", "0").lower() in ("1", "true", "yes")
